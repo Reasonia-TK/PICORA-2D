@@ -1,0 +1,68 @@
+{
+  "shortcut_file": "C:\\Users\\TK\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\PICORA-2D.lnk",
+  "icon_file": "C:\\Users\\TK\\AppData\\Local\\PICORA-2D\\icons\\picora-shared-ad39f965.ico",
+  "icon_index": 0,
+  "icons": [
+    {
+      "kind": "large",
+      "handle_source": "SHGetFileInfo/shortcut",
+      "handle": 93719837,
+      "width": 32,
+      "height": 32,
+      "matching": true,
+      "comparisons": [
+        {
+          "background": "black",
+          "matching": true,
+          "different_pixels": 0,
+          "max_channel_difference": 0,
+          "runtime_sha256": "1dcb6c691f50dedfd9894c4a01bf89db97e84ed134d53263766d67d3bc93c4ea",
+          "source_sha256": "1dcb6c691f50dedfd9894c4a01bf89db97e84ed134d53263766d67d3bc93c4ea",
+          "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-large-32x32-black-runtime.png",
+          "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-large-32x32-black-source.png"
+        },
+        {
+          "background": "white",
+          "matching": true,
+          "different_pixels": 0,
+          "max_channel_difference": 0,
+          "runtime_sha256": "1dcb6c691f50dedfd9894c4a01bf89db97e84ed134d53263766d67d3bc93c4ea",
+          "source_sha256": "1dcb6c691f50dedfd9894c4a01bf89db97e84ed134d53263766d67d3bc93c4ea",
+          "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-large-32x32-white-runtime.png",
+          "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-large-32x32-white-source.png"
+        }
+      ]
+    },
+    {
+      "kind": "small",
+      "handle_source": "SHGetFileInfo/shortcut",
+      "handle": 93850909,
+      "width": 16,
+      "height": 16,
+      "matching": true,
+      "comparisons": [
+        {
+          "background": "black",
+          "matching": true,
+          "different_pixels": 0,
+          "max_channel_difference": 0,
+          "runtime_sha256": "c9db3fdd94d2ce2b9022a31c587789a9f95ba94911e2a012ca8eb9cfbe741272",
+          "source_sha256": "c9db3fdd94d2ce2b9022a31c587789a9f95ba94911e2a012ca8eb9cfbe741272",
+          "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-small-16x16-black-runtime.png",
+          "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-small-16x16-black-source.png"
+        },
+        {
+          "background": "white",
+          "matching": true,
+          "different_pixels": 0,
+          "max_channel_difference": 0,
+          "runtime_sha256": "c9db3fdd94d2ce2b9022a31c587789a9f95ba94911e2a012ca8eb9cfbe741272",
+          "source_sha256": "c9db3fdd94d2ce2b9022a31c587789a9f95ba94911e2a012ca8eb9cfbe741272",
+          "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-small-16x16-white-runtime.png",
+          "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\shortcut-startmenu\\shortcut-small-16x16-white-source.png"
+        }
+      ]
+    }
+  ],
+  "matching": true
+}

@@ -1,0 +1,3045 @@
+"""FEM-PIC (フェーズ3)。仕様書 §9 参照。
+
+サイクル (PicSimulation.step):
+  1. 電荷堆積: P1 形状関数 (重心座標) の重みで粒子電荷を節点荷重ベクトルへ散布
+  2. ポアソン求解: 剛性行列は固定なので splu を初回のみ実行し、右辺のみ更新。
+     Dirichlet 値は V(t) = V_dc + A sin(2πft + φ) で毎ステップ更新 (RF 電極対応)
+  3. E 補間 (P1 なので所属要素の一定値) → 4. リープフロッグでプッシュ →
+  5. walk 更新・境界吸収 (壁到達粒子は除去、種別ごとに集計) → 6. 注入
+
+- 粒子種は常に electron / ion の2種を管理する
+- リープフロッグの速度は半整数ステップに置く。装荷時・注入時に初期半ステップ
+  後退キック v(-dt/2) = v(0) - (q/m) E(x) dt/2 を適用する
+- 診断は毎ステップ記録。運動エネルギーは v(n-1/2)·v(n+1/2) の時刻中心化で評価し、
+  場のエネルギー (整数ステップ) と整合させる
+- 安定性チェック: 開始時に ωpe·dt とセルサイズ/デバイ長を確認して警告文字列を返す
+- ホットループは numpy ベクトル化 (粒子 for ループなし)。walk 探索・隣接配列・
+  重心座標係数は particles.py の実装を再利用する
+- 阻止コンデンサ (自己バイアス、prompts/134): 電極の電位を circuit.BlockingCircuit で決める。節点の電荷 f が
+  誘導する電荷 −ψ̃·f (Green の相反定理) から Poisson の前に電位が決まる (_solve_phi)。伝導電流は、境界エッジで
+  吸収した粒子の電荷と電極から出た二次電子・FN 電子の +e·w を、当たった (出た) 点の P1 重みでエッジの 2 つの端の
+  節点へ分け、電極の節点の分を積む (_cap_add)
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+import numpy as np
+import scipy.sparse.linalg as spla
+from scipy.spatial import cKDTree
+
+from . import _numba_kernels
+from .circuit import BlockingCircuit, mesh_capacitor_electrodes
+from .convergence import BLOCKS_2D, BlockMap, make_monitor
+from .fem import EPS0, _material_arrays, _radial_index, assemble
+from .fn import build_fn_surface, distribute_particles, fn_segment_currents
+from .mcc import GasField, MccModel
+from .meshing import generate_mesh
+from .particles import (
+    ME,
+    MP,
+    QE,
+    _adjacency,
+    _barycentric_coeffs,
+    _boris_matrix,
+    _build_boundary_tables,
+    _init_particles,
+    _locate_initial,
+    _pack_coeffs,
+    _solid_elements,
+    _walk_step,
+    b_vector,
+)
+from .schema import PicSettings, Project, VoltageRF, VoltageWaveform, rf_components
+
+# 粒子マージ (prompts/77) のトリガー後、削り過ぎないよう目標とする残存比率。
+# n_max ちょうどまで削ると次のチェック (every ステップ後) までにまた超過して
+# 毎回大掛かりにマージし直すことになるため、少し余裕を持って 90% まで削る
+MERGE_TARGET_FRAC = 0.9
+
+# マージ対象とする最小グループサイズ。2粒子への集約に意味があるのは k≥3 から
+# (k=2 では削減にならず、k=1 では合成のしようがない)
+MERGE_MIN_GROUP = 3
+
+# 半径に比例した重み (軸対称、prompts/136): 1 ステップで 1 個の粒子を分ける数の上限。
+# 目標の重み c (r + r0) の r0 は mesh.size × RW_R0_SIZES
+RW_MAX_SPLIT = 8
+RW_R0_SIZES = 1.0
+
+# フレーム送出時の種ごとの最大粒子数 (間引き)
+MAX_FRAME_PARTICLES = 2000
+
+# walk コスト診断 (prompts/88) が timing dict に追加するキー。秒数ではないため、
+# server.py の timing.total 集計・frontend の内訳表示 (%計算・合計) からは
+# このキー集合を除外する
+WALK_DIAG_KEYS = frozenset(
+    {"walk_cells_est_e", "walk_cells_est_i", "h_mean_m", "h_min_m"}
+)
+
+# IEDF/IADF コレクタのサンプル上限 (超過分は count/total_weight のみ計上、prompts/30)
+COLLECTOR_MAX_SAMPLES = 50000
+
+# 粒子のセル順ソート間隔 (高速化③、prompts/84)。ソート自体は O(N log N) だが、
+# SORT_EVERY ステップで償却すればコストはほぼゼロになる。一方、粒子は1ステップに
+# 隣接セル数個分しか移動しないため、生成順 (電離・注入順) のまま放置しても
+# 50ステップ程度は所属要素順からの乱れが小さい。50 はこの二つのバランス点
+# (古典的な PIC の空間局所性最適化で一般的な目安)
+SORT_EVERY = 50
+
+# セル順ソートを有効化する最小メッシュ要素数 (prompts/84 の追加ガード)。
+# 実測 (backend/benchmarks/pic_bench.py): 770要素 (既定ベンチ) では
+# per-element データ (coeffs・adjacency・E場など) がまるごとキャッシュに常駐して
+# しまい、粒子順を揃えても局所性は改善せず、ソートのコスト (計数ソート後も残る
+# 配列コピー) だけが乗って 20万粒子規模で最大 +9% の退行を確認した。一方
+# 20928要素では per-element データがキャッシュに収まらなくなり -5.2% の高速化を
+# 確認できた。要素あたりの参照データ (coeffs 4本 + adjacency 3本 + E場2本 など
+# 概算100バイト級) × 4000要素 ≒ 数百KB〜1MB で L2 級のサイズになる見込みを
+# 境界の目安とする。これ未満のメッシュではソートを完全にスキップし
+# (呼び出しコストも含めて従来経路と実質不変)、粗いメッシュの小規模計算で
+# 退行しないことを優先する。
+SORT_MIN_ELEMS = 4000
+
+# walk 並列実行用の共有ワーカースレッド (遅延生成、プロセスで1本)
+_WALK_POOL: ThreadPoolExecutor | None = None
+
+# FN 電界放出の1ステップあたりの放出マクロ電子数の上限 (prompts/53)。
+# 強電界 + 小さい macro_weight では I·dt/(e·w) が天文学的な数になり得るため、
+# 超過時はマクロ重みを引き上げて粒子数をこの上限に抑える (総電荷は保存)
+FN_MAX_MACROS_PER_STEP = 10000
+
+# 自動スレッド選択でチャンク並列を始める種ごとの粒子数。NumPyフォールバックの
+# 実測では2万粒子/種で4スレッドが逆効果、10万粒子/種で有効だったため、中間の
+# 5万を保守的な開始点にする。Numbaありでも小配列のprange起動コストを避けられる。
+AUTO_THREAD_MIN_PARTICLES = 50000
+# 自動選択の上限。全論理コアを与えるとUI・WebSocket・BLASと競合し、HT分の論理コアは
+# 数値カーネルではほぼ効かないため「論理コア数の半分 (≒物理コア相当)」を基本とする。
+# 小コア機 (2〜4論理) では下限2を維持 (旧上限2の実測はこの規模の環境によるもの)。
+# メニーコア機でもメモリ帯域の飽和と直列部 (solve等) の存在から16で頭打ちにする。
+# 明示指定なら最大128まで許す (デュアルソケット機の96論理スレッド等に対応)。
+AUTO_THREAD_MAX = 16
+
+
+def _auto_thread_cap(cores: int) -> int:
+    """自動選択時の上限スレッド数 (論理コア数から決める)。"""
+    return max(2, min(AUTO_THREAD_MAX, cores // 2))
+
+
+def _walk_pool() -> ThreadPoolExecutor:
+    global _WALK_POOL
+    if _WALK_POOL is None:
+        _WALK_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pic-walk")
+    return _WALK_POOL
+
+
+def _effective_thread_count(
+    requested: int, n_particles_per_species: int, cpu_count: int | None = None
+) -> int:
+    """pic.threads の実効値を返す。0は粒子数とCPU数に応じた自動選択。
+
+    明示指定 (1以上) は従来どおりその値を尊重する。自動時だけ、小規模計算の
+    スレッド起動コストと大規模計算の並列効果の両方を考慮する。
+    """
+    if requested > 0:
+        return int(requested)
+    cores = max(1, int(cpu_count if cpu_count is not None else (os.cpu_count() or 1)))
+    if n_particles_per_species < AUTO_THREAD_MIN_PARTICLES:
+        return 1
+    return min(_auto_thread_cap(cores), cores)
+
+
+def _map_gas_field_to_mesh(field: GasField, dst_centroids: np.ndarray) -> GasField:
+    """DSMC 専用メッシュ (mesh_scale>1、prompts/89) の GasField を PIC メッシュへ写す。
+
+    PIC メッシュの各要素重心 (dst_centroids) を DSMC メッシュ (field.src_nodes/
+    src_triangles) 上で点位置特定し、対応する DSMC 要素の n_g/t_g/u_g をそのまま
+    引き写す (DSMC はセル定数値なので P1 補間はせず要素値をコピーする)。
+
+    点位置特定は cKDTree で最も近い DSMC 要素重心を初期値にし、particles.py の
+    walk (_walk_step) で重心座標により実際に内包する要素へ確定する
+    (postprocess.py の総当たり方式は要素数×要素数のオーダーで大メッシュには
+    重いため、既存の walk 探索インフラを流用する)。ドメイン外に出た
+    (absorbed=True) 場合、_walk_step は最後に内側にいた要素をそのまま返す仕様
+    なので、追加のフォールバック処理なしで「境界に最も近い要素」に自然に収まる。
+    """
+    assert field.src_nodes is not None and field.src_triangles is not None
+    nodes, tris = field.src_nodes, field.src_triangles
+    src_centroids = nodes[tris].mean(axis=1)
+    _, guess = cKDTree(src_centroids).query(dst_centroids)
+    coeffs = _barycentric_coeffs(nodes, tris)
+    adjacency = _adjacency(tris)
+    elem, _absorbed, _b_elem, _b_loc = _walk_step(
+        coeffs, adjacency, guess.astype(np.int64), dst_centroids, packed=_pack_coeffs(coeffs)
+    )
+    return GasField(
+        n_g=field.n_g[elem],
+        t_g=field.t_g[elem] if field.t_g is not None else None,
+        u_g=field.u_g[elem] if field.u_g is not None else None,
+    )
+
+
+def _eval_waveform(phase, v, freq_hz: float, t):
+    """CSV インポート波形 V_wf(t) の評価 (prompts/73)。単体テストから直接呼べるよう
+    モジュール関数として切り出す (PicSimulation の初期化なしで検証できる)。
+
+    phase は [0, 1) に正規化済みの位相 (昇順)、v は対応する電圧。実際の周期は
+    freq_hz で決まり、時刻 t の位相は frac(t·freq_hz) (0〜1 を繰り返す)。
+    末尾サンプルと先頭サンプルの間 (位相 phase[-1] 〜 1) が非連続にならないよう、
+    phase 配列の末尾に仮想的に (phase[0]+1, v[0]) を足してから線形補間する
+    (= 1周期ループの折返しを連続にするため)。
+    """
+    phase = np.asarray(phase, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    frac = np.mod(np.asarray(t, dtype=np.float64) * freq_hz, 1.0)
+    phase_ext = np.concatenate([phase, [phase[0] + 1.0]])
+    v_ext = np.concatenate([v, [v[0]]])
+    return np.interp(frac, phase_ext, v_ext)
+
+
+def _eval_rf(components: "list[VoltageRF]", t: float) -> float:
+    """RF 成分リストの和 V_rf(t) = Σ_k amplitude_k·sin(2π·freq_hz_k·t + phase_deg_k) を返す
+    (prompts/93)。_dirichlet_values (2D、上記) の rf_amp * np.sin(rf_omega*t + rf_phase) と
+    完全に同じ式・位相規約 (度→ラジアン変換は math.radians) をスカラー版として切り出し、
+    1D (pic1d.py) の電極電圧評価と共有する。components が空なら 0.0 (寄与なし)。
+    """
+    v = 0.0
+    for c in components:
+        v += c.amplitude * math.sin(2.0 * math.pi * c.freq_hz * t + math.radians(c.phase_deg))
+    return v
+
+
+@dataclass
+class PicSpecies:
+    """マクロ粒子種。状態はすべて numpy 配列で保持する。"""
+
+    name: str
+    q: float               # 電荷 [C]
+    m: float               # 質量 [kg]
+    x: np.ndarray          # (n, 2) 位置 [m]
+    v: np.ndarray          # (n, 3) 速度 [m/s] (2d3v。E は vx, vy のみに作用。半整数ステップ)
+    w: np.ndarray          # (n,) マクロ重み (実粒子数/マクロ粒子)
+    elem: np.ndarray       # (n,) 所属要素番号
+    mobile: bool = True    # False ならプッシュしない (immobile_ions)
+    wall_absorbed: int = 0  # 壁吸収の累計 (マクロ粒子数)
+    # (n, 3) 所属要素での重心座標キャッシュ (walk が計算した値の再利用)。
+    # None または長さ不一致なら電荷堆積時に再計算する。x を差し替えたら None にすること
+    bary: np.ndarray | None = None
+    # (n, 3) 所属要素の節点番号キャッシュ (tris[elem] の再利用)。同上のルール
+    nidx: np.ndarray | None = None
+
+
+class PicSimulation:
+    """FEM-PIC シミュレーション本体。
+
+    __init__ でメッシュ生成・FEM 行列組み立て・K_ff の LU 前分解 (1回のみ) を行い、
+    step() ごとに右辺のみ更新して解く。
+    """
+
+    def __init__(self, project: Project, gas_field: GasField | None = None):
+        if project.pic is None:
+            raise ValueError("project.pic が指定されていません")
+        self.project = project
+        self.pic: PicSettings = project.pic
+        # 非一様背景ガス場 (prompts/54)。DSMC の定常解などを MCC が参照する
+        self.gas_field = gas_field
+        # 軸対称モード (prompts/47)。rz: 径方向 = y、rz_x0: 径方向 = x。
+        # マクロ粒子は「リング」(周方向に一様な実粒子 w 個の輪) として扱い、
+        # v[:, 2] は vz の代わりに vθ (周方向速度) を表す
+        self.ridx = _radial_index(project.coord)
+        self.rz = self.ridx is not None
+
+        # ---- メッシュ・幾何前処理 (particles.py の実装を再利用) --------------
+        self.mesh = generate_mesh(project)
+        mesh = self.mesh
+        self.n_nodes = len(mesh.nodes)
+        self.tris = mesh.triangles
+        self.coeffs = _barycentric_coeffs(mesh.nodes, self.tris)  # (a, b, c, det)
+        self._coeffs_packed = _pack_coeffs(self.coeffs)  # walk 用 (M,10) 詰め込み係数
+        self.adjacency = _adjacency(self.tris)
+        det = self.coeffs[3]
+        self.area = 0.5 * np.abs(det)          # (M,) 要素面積
+        self.eps_elem, _ = _material_arrays(project, mesh)  # (M,) 要素ごとの ε
+        # 要素「体積」: xy = 面積 (奥行き1m換算)、rz = 2π r̄ A (周方向積分)。
+        # xy では self.area と同一オブジェクトなので既存経路はビット単位で不変
+        if self.rz:
+            self._r_nodes = mesh.nodes[self.tris][:, :, self.ridx]  # (M, 3) 頂点の r
+            self.r_bar = self._r_nodes.mean(axis=1)                 # (M,) 要素重心半径
+            self.elem_vol = 2.0 * np.pi * self.r_bar * self.area
+        else:
+            self.elem_vol = self.area
+
+        # 周期境界の正準化写像 (スレーブ→マスター)。電荷堆積・密度積算・求解は
+        # 正準節点番号 (tris_dep) を使い、粒子 walk・E 補間は元の tris を使う
+        self.canon = mesh.periodic_map
+        self.tris_dep = self.canon[self.tris] if self.canon is not None else self.tris
+
+        # 誘電体 (固体) 要素のマスク: 粒子は侵入できず表面で吸収する (prompts/24)。
+        # 場の計算は変更しない (εr 付き要素としてメッシュに残る)。無ければ None
+        self._solid_elem = _solid_elements(project, mesh)
+
+        # ---- walk コスト診断 (prompts/88): 代表セル寸法 ----------------------
+        # h_i = sqrt(2·A_i) (三角形の面積から逆算した代表長さ)。理想は「粒子が
+        # 実際にいる要素」の平均だが、簡易版として気体要素 (固体を除く) 全体の
+        # 単純平均 h_mean と最小 h_min を出す。h_min/h_mean が小さいほどメッシュの
+        # ローカル細分化が強いことを示す (frontend のヒント表示に使う)
+        h_all = np.sqrt(
+            2.0 * (self.area if self._solid_elem is None else self.area[~self._solid_elem])
+        )
+        self._h_mean = float(h_all.mean()) if len(h_all) else 0.0
+        self._h_min = float(h_all.min()) if len(h_all) else 0.0
+
+        # 誘電体 SEE (prompts/38): 固体要素ごとの γ (see_gamma > 0 の dielectric)。
+        # 該当領域が無ければ None (従来経路と完全一致)
+        self._solid_gamma: np.ndarray | None = None
+        if self._solid_elem is not None:
+            gam_elem = np.zeros(len(self.tris))
+            has_gamma = False
+            for i, region in enumerate(project.geometry.regions):
+                if region.type == "dielectric" and region.see_gamma > 0.0:
+                    gam_elem[mesh.tri_region == i] = region.see_gamma
+                    has_gamma = True
+            if has_gamma:
+                self._solid_gamma = gam_elem
+
+        # 誘電体の表面電荷 (prompts/25): 吸収された粒子の電荷 w·q [C/m] を節点へ
+        # P1 射影で蓄積し、毎ステップのポアソン右辺へ恒常的に加える。
+        # 実行開始時は 0 で、停止までラン内で持続する
+        self.q_surf = np.zeros(self.n_nodes)
+
+        # ---- FEM 行列: K_ff を splu で1回だけ前分解 --------------------------
+        k, self.f_static = assemble(project, mesh)  # 静的 charge 領域の右辺を含む
+        items = sorted(mesh.dirichlet.items())      # 節点順に固定して決定的に
+        self.fixed = np.array([i for i, _ in items], dtype=np.int64)
+        self.v_dc = np.array([v for _, v in items], dtype=np.float64)
+        # RF 成分 (デュアル周波数対応、prompts/49): (n_fixed, K) 行列。
+        # K は全電極の最大成分数 (成分の無い列はゼロパディング = 振幅0で寄与なし)。
+        # K=1 (従来の単一周波数) では sum(axis=1) が単一要素の恒等なので数値不変
+        rf = mesh.dirichlet_rf
+        kmax = max((len(c) for c in rf.values()), default=1)
+        kmax = max(kmax, 1)
+        n_fixed = len(items)
+        self.rf_amp = np.zeros((n_fixed, kmax))
+        self.rf_omega = np.zeros((n_fixed, kmax))
+        self.rf_phase = np.zeros((n_fixed, kmax))
+        for row, (i, _) in enumerate(items):
+            for kc, (amp, freq, ph) in enumerate(rf.get(i, ())):
+                self.rf_amp[row, kc] = amp
+                self.rf_omega[row, kc] = 2.0 * math.pi * freq
+                self.rf_phase[row, kc] = math.radians(ph)
+        # CSV インポート波形 (prompts/73): 種類数が少ない想定なので、電極ごとに
+        # 配列を持つのではなく「波形リスト (self._waveforms) + 節点→波形インデックス
+        # (self._wf_index、-1=波形なし)」で持つ。評価時 (_dirichlet_values) は
+        # 波形ごとに np.interp を1回だけ呼び、インデックスで各節点へ展開する
+        wf_map = mesh.dirichlet_waveform
+        self._waveforms: list[VoltageWaveform] = []
+        self._wf_index = np.full(n_fixed, -1, dtype=np.int64)
+        wf_id_to_idx: dict[int, int] = {}
+        for row, (i, _) in enumerate(items):
+            wf = wf_map.get(i)
+            if wf is None:
+                continue
+            key = id(wf)
+            idx = wf_id_to_idx.get(key)
+            if idx is None:
+                idx = len(self._waveforms)
+                wf_id_to_idx[key] = idx
+                self._waveforms.append(wf)
+            self._wf_index[row] = idx
+        exclude = self.fixed
+        if self.canon is not None:
+            # 周期スレーブ節点は自由度から除外する (剛性行列の行がマスターへ寄っている)
+            slaves = np.nonzero(self.canon != np.arange(self.n_nodes))[0]
+            exclude = np.union1d(self.fixed, slaves)
+        self.free = np.setdiff1d(np.arange(self.n_nodes), exclude)
+        if len(self.free) == 0:
+            raise ValueError("自由節点がありません (全節点が Dirichlet)")
+        self.k_fd = k[self.free][:, self.fixed].tocsr()
+        self.lu = spla.splu(k[self.free][:, self.free].tocsc())
+
+        # ---- dt とプラズマパラメータ -----------------------------------------
+        ip = self.pic.initial_plasma
+        amu = ip.ion_mass_amu if ip is not None else 40.0
+        self.m_ion = amu * MP
+        wpe = 0.0
+        if ip is not None:
+            wpe = math.sqrt(ip.density * QE**2 / (EPS0 * ME))
+        if self.pic.dt is not None:
+            self.dt = float(self.pic.dt)
+        elif wpe > 0.0:
+            self.dt = 0.1 / wpe  # 既定: ωpe·dt = 0.1
+        else:
+            raise ValueError("pic.dt を指定してください (初期密度が無いため自動決定できません)")
+
+        # ---- 安定性チェック (警告のみ、実行は継続) ---------------------------
+        self.warnings: list[str] = []
+        if wpe > 0.0:
+            if wpe * self.dt > 0.3:
+                self.warnings.append(
+                    f"ωpe·dt = {wpe * self.dt:.3g} > 0.3: 時間刻みが粗すぎます (数値不安定の恐れ)"
+                )
+            if ip.te_ev > 0.0:
+                lam_d = math.sqrt(EPS0 * ip.te_ev * QE / (ip.density * QE**2))
+                p = mesh.nodes[self.tris]
+                edges = (
+                    np.linalg.norm(p[:, 0] - p[:, 1], axis=1)
+                    + np.linalg.norm(p[:, 1] - p[:, 2], axis=1)
+                    + np.linalg.norm(p[:, 2] - p[:, 0], axis=1)
+                ) / 3.0
+                h_mean = float(edges.mean())
+                if h_mean > 3.0 * lam_d:
+                    self.warnings.append(
+                        f"平均セルサイズ {h_mean:.3g} m > 3×デバイ長 {lam_d:.3g} m: "
+                        "メッシュがデバイ長を解像していません"
+                    )
+
+        # ---- RF 1周期の位相分解 (prompts/28) ----------------------------------
+        # RF 周波数は boundaries / conductor 領域の voltage_rf から最初に見つかった
+        # ものを使う。無ければ (または phase_bins=0 なら) cycle 機能は無効
+        self._cycle_freq = self._find_rf_freq()
+        self._cycle_bins = int(self.pic.phase_bins)
+        self._cycle_enabled = self._cycle_freq is not None and self._cycle_bins > 0
+        self._cycle_period = 1.0 / self._cycle_freq if self._cycle_enabled else 0.0
+        # 阻止コンデンサ (prompts/134)。下の半ステップ後退キックの最初の求解で回路の電荷 Q_N が決まる
+        self._init_circuit(k)
+        if self._cycle_enabled:
+            # 平均区間が RF 1周期より短いとステップ数 0 の位相ビンが生じるため警告
+            avg = (
+                self.pic.avg_steps
+                if self.pic.avg_steps is not None
+                else max(1, self.pic.n_steps // 4)
+            )
+            avg = min(avg, self.pic.n_steps)
+            # 1周期あたりのステップ数。推奨値の算出に使う (ユーザーが具体的に
+            # どの値へ変えれば良いか分かるよう、警告に数値で含める)
+            steps_per_period = self._cycle_period / self.dt
+            if avg * self.dt < self._cycle_period:
+                # 平均区間が1周期未満だと、ビン数をいくら減らしても訪れない位相帯が
+                # 残る。対処は平均ステップ数を増やす一択なので、必要数を明示する
+                need = int(math.ceil(steps_per_period))
+                self.warnings.append(
+                    f"位相分解平均の区間 {avg * self.dt:.3g} s (avg_steps={avg}) が "
+                    f"RF 1周期 {self._cycle_period:.3g} s (≈{need} ステップ) より短いため、"
+                    f"空の位相ビンが生じます。平均ステップ数を {need} 以上 "
+                    f"(推奨: 統計をならすため {3 * need} = 3周期分以上) にしてください"
+                )
+            elif self._cycle_bins > steps_per_period:
+                # ビン幅が1ステップの時間刻みより細かいと、dt が周期と整合的
+                # (例: dt = T/N) な場合にサンプルの入らないビンが固定的に生じる。
+                # 多周期平均で dt と周期が非整合なら埋まることもあるため「可能性」表現
+                self.warnings.append(
+                    f"位相ビン数 {self._cycle_bins} が RF 1周期あたりのステップ数 "
+                    f"(≈{steps_per_period:.1f}) より多いため、サンプルの入らない位相ビンが"
+                    f"生じる可能性があります。ビン数 {int(steps_per_period)} 以下を推奨します"
+                )
+
+        # ---- 半径に比例した重み (軸対称、prompts/136) -----------------------
+        # 目標の重み w_t(r) = c (r + r0)。c は初めの装荷で決める。粒子マージ (merge) とは重みの調整が
+        # 重なるので、merge があるときは使わない
+        self._rw = bool(self.rz and self.pic.radial_weighting and ip is not None and self.pic.merge is None)
+        if self.rz and self.pic.radial_weighting and ip is not None and self.pic.merge is not None:
+            self.warnings.append("粒子マージ (merge) を使うので、半径に比例した重み (radial_weighting) は使いません")
+        self._rw_r0 = RW_R0_SIZES * float(project.mesh.size) if self.rz else 0.0
+        self._rw_c = 0.0
+        self.split_added = 0  # 半径に比例した重みの分割で増やした累計マクロ粒子数 (diag "split")
+
+        # ---- 初期プラズマ装荷 -------------------------------------------------
+        # 電子・イオンを同一位置に装荷して初期の厳密な電気的中性を保つ (quiet start)
+        self.species: dict[str, PicSpecies] = {}
+        if ip is not None:
+            rng = np.random.default_rng(ip.seed)
+            n_macro = self.pic.n_macro
+            # 装荷可能体積 = 誘電体 (固体) 要素を除いた体積
+            # (xy: 面積 = 奥行き1m換算、rz: 2πr̄A。elem_vol は xy では area と同一)
+            if self._solid_elem is None:
+                area_load = float(self.elem_vol.sum())
+            else:
+                area_load = float(self.elem_vol[~self._solid_elem].sum())
+            w0 = ip.density * area_load / n_macro  # マクロ重み (実粒子数/マクロ。rz はリング)
+            if self._rw:
+                # 半径に比例した重み: r/(r + r0) の確率で採った位置に c (r + r0) の重み (全電荷は同じ)
+                x0, elem0 = self._sample_radial(rng, n_macro)
+                rr = x0[:, self.ridx] + self._rw_r0
+                self._rw_c = ip.density * area_load / float(rr.sum())
+                w_init = self._rw_c * rr
+            else:
+                x0, elem0 = self._sample_uniform(rng, n_macro)
+                w_init = np.full(n_macro, w0)
+            for name, q, m, t_ev, mobile in (
+                ("electron", -QE, ME, ip.te_ev, True),
+                ("ion", QE, self.m_ion, ip.ti_ev, not ip.immobile_ions),
+            ):
+                sigma = math.sqrt(t_ev * QE / m) if t_ev > 0.0 else 0.0
+                # 2d3v: Maxwell 速度は3成分で抽選する
+                v = (
+                    rng.normal(0.0, sigma, size=(n_macro, 3))
+                    if sigma > 0.0
+                    else np.zeros((n_macro, 3))
+                )
+                self.species[name] = PicSpecies(
+                    name, q, m, x0.copy(), v, w_init.copy(), elem0.copy(), mobile
+                )
+        else:
+            for name, q, m in (("electron", -QE, ME), ("ion", QE, self.m_ion)):
+                self.species[name] = PicSpecies(
+                    name, q, m,
+                    np.zeros((0, 2)), np.zeros((0, 3)),
+                    np.zeros(0), np.zeros(0, dtype=np.int64),
+                )
+
+        # ---- 注入の前計算 (エミッタ形状は固定なので所属要素をキャッシュ) ------
+        inj = self.pic.injection
+        if inj is not None:
+            sp = self.species[inj.species]
+            pos, vel = _init_particles(inj.emitter, sp.m)
+            self._inj_pos = pos
+            self._inj_vel_base = vel  # mono の場合の決定的な速度
+            self._inj_elem = _locate_initial(self.coeffs, pos)
+            # 注入位置・所属要素は固定なので重心座標も前計算できる
+            self._inj_bary = self._bary_of(pos, self._inj_elem)
+            self._inj_rng = np.random.default_rng(inj.emitter.seed)
+            # 毎ステップの実電荷 I·dt を n 個のマクロ粒子へ等分
+            self._inj_w = inj.current_a_per_m * self.dt / (QE * inj.emitter.n)
+
+        # ---- FN 電界放出 (prompts/46) ----------------------------------------
+        # fn=null なら無効 (従来動作と完全一致)。毎ステップの表面電界から
+        # I·dt 分の電子を放出面 (電極表面エッジ列) から注入する
+        fn = self.pic.fn
+        self._fn_surf = None
+        self.fn_events = 0  # 放出したマクロ電子の累計
+        if fn is not None:
+            self._fn_surf = build_fn_surface(project, self.mesh, self.adjacency, fn)
+        if self._fn_surf is not None:
+            if fn.macro_weight is not None:
+                self._fn_w = float(fn.macro_weight)
+            elif ip is not None:
+                self._fn_w = w0  # 初期プラズマと同じマクロ重み
+            else:
+                raise ValueError(
+                    "pic.fn.macro_weight を指定してください (初期プラズマが無いため自動決定できません)"
+                )
+            # セグメントごとの端数マクロ粒子の持ち越し (毎ステップの床関数の余り)
+            self._fn_frac = np.zeros(len(self._fn_surf.elem))
+            self._fn_rng = np.random.default_rng(fn.seed)
+            self._fn_speed = (
+                math.sqrt(2.0 * fn.init_energy_ev * QE / ME)
+                if fn.init_energy_ev > 0.0
+                else 0.0
+            )
+
+        # ---- イオンサブサイクリング (prompts/50) ------------------------------
+        # イオンを _sub ステップに1回、_sub·dt で押す。休止ステップ中はイオンが
+        # 動かないため電荷堆積ベクトルをキャッシュして再利用する (イオン配列が
+        # 変わる箇所 — プッシュ・電離生成・イオン注入 — で必ず無効化すること)
+        self._sub = max(1, int(self.pic.ion_subcycle))
+        self._f_ion_cache: np.ndarray | None = None
+        self._last_ke_i = 0.0  # 休止ステップの KE 診断用 (直近プッシュ時の値を流用)
+        if self._sub > 1:
+            # サブサイクルの実効刻みでイオンがセルを大きく飛び越えると、walk自体は
+            # 複数セルを辿れても電場・軌道の時間離散化が粗くなる。初期熱速度の6σ相当と
+            # 電極電位差による加速エネルギーから保守的な移動量を見積もって警告する。
+            tri_pts = mesh.nodes[self.tris]
+            h_min = float(
+                min(
+                    np.linalg.norm(tri_pts[:, 0] - tri_pts[:, 1], axis=1).min(),
+                    np.linalg.norm(tri_pts[:, 1] - tri_pts[:, 2], axis=1).min(),
+                    np.linalg.norm(tri_pts[:, 2] - tri_pts[:, 0], axis=1).min(),
+                )
+            )
+            v_lo = self.v_dc - np.sum(np.abs(self.rf_amp), axis=1)
+            v_hi = self.v_dc + np.sum(np.abs(self.rf_amp), axis=1)
+            waveform_peak = max(
+                (
+                    float(np.max(np.abs(np.asarray(wf.v, dtype=np.float64))))
+                    for wf in self._waveforms
+                ),
+                default=0.0,
+            )
+            voltage_span = (
+                float(v_hi.max() - v_lo.min()) + 2.0 * waveform_peak
+                if len(v_lo)
+                else 2.0 * waveform_peak
+            )
+            ti_ev = float(ip.ti_ev) if ip is not None else 0.0
+            ion_energy_est_ev = max(0.0, voltage_span + 6.0 * ti_ev)
+            if ion_energy_est_ev > 0.0 and h_min > 0.0:
+                v_i_est = math.sqrt(2.0 * ion_energy_est_ev * QE / self.m_ion)
+                cell_step = v_i_est * self.dt * self._sub / h_min
+                if cell_step > 0.5:
+                    self.warnings.append(
+                        f"イオンサブサイクルの推定移動量が最小セル幅の {cell_step:.2f} 倍 "
+                        f"> 0.5 (ion_subcycle={self._sub}): イオン軌道が粗くなる恐れがあります "
+                        "(ion_subcycle を下げてください)"
+                    )
+
+        # ---- 粒子チャンク並列 (prompts/50) ------------------------------------
+        # walk 探索を粒子チャンクに分けてスレッド並列化する。粒子ごとの walk は
+        # 独立で numpy ufunc は GIL を解放するため実効的。チャンク分割しても
+        # 各粒子の演算は不変なので、結果は逐次実行とビット単位で一致する
+        n_particles_per_species = max(
+            [self.pic.n_macro, *(len(sp.x) for sp in self.species.values())]
+        )
+        self._nthreads = _effective_thread_count(
+            int(self.pic.threads), n_particles_per_species
+        )
+        self.effective_threads = self._nthreads
+        self._chunk_pool = (
+            ThreadPoolExecutor(max_workers=self._nthreads, thread_name_prefix="pic-chunk")
+            if self._nthreads > 1
+            else None
+        )
+        # push+walk融合カーネルの出力バッファ。現在の粒子状態と共有しない方を
+        # ping-pong利用し、毎ステップの大規模np.empty確保を避ける。
+        self._push_walk_buffers: dict[str, list[tuple[np.ndarray, ...]]] = {}
+        # numba の walk カーネル (prange) が使うスレッド数を pic.threads に合わせる
+        # (numba 無し環境では no-op。numpy フォールバックは上の _chunk_pool で並列化する)
+        _numba_kernels.set_num_threads(self._nthreads)
+
+        # ---- 一様磁場 (prompts/51) --------------------------------------------
+        # Boris 回転行列を種ごとに前計算する (イオンサブサイクルで dt が異なるため)。
+        # b_field なし (または全成分 0) では None = 従来経路と完全一致。
+        # 初期/注入の半ステップ後退キックは E のみの近似 (回転は初回ステップから)
+        self._b = b_vector(project)
+        self._boris_rt: dict[str, np.ndarray] = {}
+        if self._b is not None:
+            for name, q_s, m_s in (("electron", -QE, ME), ("ion", QE, self.m_ion)):
+                dt_s = self.dt * self._sub if (name == "ion" and self._sub > 1) else self.dt
+                self._boris_rt[name] = _boris_matrix(q_s, m_s, dt_s, self._b).T
+            wc_e = QE * float(np.linalg.norm(self._b)) / ME
+            if wc_e * self.dt > 0.3:
+                self.warnings.append(
+                    f"ωce·dt = {wc_e * self.dt:.3g} > 0.3: 電子サイクロトロン運動を"
+                    "解像できていません (dt を小さくしてください)"
+                )
+
+        # ---- MCC (モンテカルロ衝突、prompts/19) ------------------------------
+        # mcc=null なら無効 (従来の無衝突動作と完全一致)。
+        # gas_field あり (prompts/54) なら要素数の整合を検査して MCC へ渡す。
+        # DSMC 専用メッシュ (mesh_scale>1、prompts/89) で要素数が一致しない場合は、
+        # 付随する DSMC メッシュ (src_nodes/src_triangles) があれば PIC メッシュへ
+        # 一度だけマッピングする (O(N_pic要素)。mesh_scale=1.0 の従来経路では要素数が
+        # 必ず一致するのでこの分岐に入らず、結果はビット不変)
+        if gas_field is not None and len(gas_field.n_g) != len(self.tris):
+            if gas_field.src_nodes is None or gas_field.src_triangles is None:
+                raise ValueError(
+                    f"ガス場の要素数 ({len(gas_field.n_g)}) がメッシュの要素数 "
+                    f"({len(self.tris)}) と一致しません (DSMC を再実行してください)"
+                )
+            centroids = self.mesh.nodes[self.tris].mean(axis=1)
+            gas_field = _map_gas_field_to_mesh(gas_field, centroids)
+            self.gas_field = gas_field
+        self.mcc = (
+            MccModel(self.pic.mcc, self.m_ion, gas_field)
+            if self.pic.mcc is not None
+            else None
+        )
+        if self.mcc is not None:
+            # 衝突頻度の健全性チェック (prompts/57)。非一様ガス場では ν_max が
+            # 最大密度で評価されるため、密度スパイクや高圧領域があると毎ステップ
+            # ほぼ全粒子が衝突候補になり、dt が実効的に粗すぎる状態になり得る
+            # 代表上限 200 eV (シース加速の典型上限) までの ν_max で評価する
+            # (実行時の適応 ν_max と同じテーブル。全域 max だと keV 域の断面積で
+            # 過大評価になるため)
+            for label, table, dt_eff in (
+                ("電子", self.mcc._nu_e_table, self.dt),
+                ("イオン", self.mcc._nu_i_table, self.dt * self._sub),
+            ):
+                numax = MccModel._numax_upto(table, 200.0)
+                if numax > 0.0:
+                    p_coll = 1.0 - math.exp(-numax * dt_eff)
+                    if p_coll > 0.5:
+                        sub_note = (
+                            f" (ion_subcycle={self._sub} の実効刻み)"
+                            if label == "イオン" and self._sub > 1
+                            else ""
+                        )
+                        self.warnings.append(
+                            f"{label}の1回の更新衝突候補率が {p_coll:.2f} > 0.5{sub_note} "
+                            "(〜200 eV 域): 実効時間刻みが衝突頻度に対して粗すぎます "
+                            "(dtまたはion_subcycleを小さくするか、ガス場の最大密度を"
+                            "確認してください)"
+                        )
+            if gas_field is not None:
+                n_arr = np.asarray(gas_field.n_g, dtype=np.float64)
+                pos_n = n_arr[n_arr > 0.0]
+                if len(pos_n):
+                    med = float(np.median(pos_n))
+                    if med > 0.0 and float(n_arr.max()) > 100.0 * med:
+                        self.warnings.append(
+                            f"ガス場の最大密度 {n_arr.max():.3g} m^-3 が中央値 {med:.3g} の"
+                            "100倍を超えています (DSMC の統計スパイクの可能性。"
+                            "n_particles や avg_steps を増やして再計算を検討してください)"
+                        )
+
+        # ---- SEE (二次電子放出) の境界エッジ属性表 ----------------------------
+        mcc_seed = self.pic.mcc.seed if self.pic.mcc is not None else 0
+        self._see_rng = np.random.default_rng(mcc_seed + 12345)
+        self._see_speed = math.sqrt(2.0 * self.pic.see_energy_ev * QE / ME)
+        self._build_see_edges()
+
+        # ---- 鏡面反射 (reflect_edges + symmetry)・周期エッジの前計算 -----------
+        self._build_boundary_edges()
+
+        # ---- 粒子マージ (高速化③、prompts/77) ---------------------------------
+        # merge=None (既定) では以下は一切実行されず、rng も生成しない。
+        # これにより OFF 時は従来の実行経路とビット単位で完全一致する
+        self.merge_events = 0    # マージ実行 (セル×オクタントの置換) の累計回数
+        self.merge_removed = 0   # マージで削減した累計マクロ粒子数 (diag "merged")
+        if self.pic.merge is not None:
+            self._merge_rng = np.random.default_rng(mcc_seed + 54321)
+        if self._rw:
+            self._rw_rng = np.random.default_rng(mcc_seed + 104729)
+
+        # ---- 節点密度アキュムレータ (enable_density_accum で有効化) -----------
+        self._accum_start: int | None = None
+        self._accum_count = 0
+        self._accum: dict[str, np.ndarray] = {}
+        # 時間平均フィールドのアキュムレータ
+        # (prompts/26、平均区間の最初のステップで遅延確保)
+        self._accum_phi: np.ndarray | None = None
+        self._accum_e: np.ndarray | None = None
+        self._accum_ke_e: np.ndarray | None = None
+        self._accum_ion: np.ndarray | None = None
+        # run_batch 完了時の時間平均フィールド (averaged_fields() の結果)
+        self.fields: dict | None = None
+        # 位相分解アキュムレータ (prompts/28、enable_density_accum で確保)
+        self._cycle_phi: np.ndarray | None = None    # (bins, N)
+        self._cycle_ne: np.ndarray | None = None     # (bins, N) 節点重み積算
+        self._cycle_ni: np.ndarray | None = None
+        self._cycle_count: np.ndarray | None = None  # (bins,) ビンごとのステップ数
+        # 位相分解の追加フィールド (prompts/52): E ベクトル (要素)・電子運動エネルギー・
+        # 電離イベント (いずれも位相ビンごとの積算)
+        self._cycle_e: np.ndarray | None = None      # (bins, M, 2)
+        self._cycle_ke: np.ndarray | None = None     # (bins, N)
+        self._cycle_ion: np.ndarray | None = None    # (bins, N)
+        # 最後の1周期の粒子スナップショット (run_batch で確保)
+        self._cycle_particles: dict[str, list] | None = None
+        self._snap_t_start = math.inf
+        # run_batch 完了時の位相分解データ (cycle_data() の結果)
+        self.cycle: dict | None = None
+
+        # ---- IEDF/IADF コレクタ (prompts/30、複数対応 prompts/36) -------------
+        # 平均区間中に吸収されたイオンのうち、各コレクタ線分から距離 tol 以内かつ
+        # 線分区間内で吸収されたものをコレクタごとに記録する。
+        # 旧単数形 collector はスキーマ側で collectors へ正規化済み (空なら無効)
+        self.collector_results: list[dict] | None = None
+        self.collector_result: dict | None = None  # 先頭コレクタのエイリアス (後方互換)
+        self._collectors_st: list[dict] = []  # コレクタごとの前計算 + 記録ストレージ
+        for col in self.pic.collectors:
+            p1 = np.asarray(col.p1, dtype=np.float64)
+            p2 = np.asarray(col.p2, dtype=np.float64)
+            seg = p2 - p1
+            seg_len = float(np.hypot(seg[0], seg[1]))
+            if seg_len <= 0.0:
+                raise ValueError("collector の p1 と p2 が同一点です")
+            tan = seg / seg_len  # 接線 (p1→p2)
+            self._collectors_st.append(
+                {
+                    "p1": p1,
+                    "len": seg_len,
+                    "tan": tan,
+                    "nrm": np.array([-tan[1], tan[0]]),  # 法線
+                    "tol": col.tol if col.tol is not None else project.mesh.size,
+                    # チャンク追記 (numpy 配列のリスト) で高速に記録する
+                    "e": [], "a": [], "w": [],
+                    "count": 0,     # 記録したマクロイオン数 (総数)
+                    "weight": 0.0,  # 総実イオン数 [1/m]
+                    "samples": 0,   # 保存済みサンプル数 (上限はコレクタごとに適用)
+                }
+            )
+
+        # ---- EEDF/EEPF 領域 (prompts/85) --------------------------------------
+        # 時間平均区間中の毎ステップ、各領域 (軸平行矩形) 内の電子を重み付き
+        # エネルギーヒストグラムへ加算する (コレクタと同じ「平均区間内のみ集計」の
+        # ライフサイクル)。e_max_ev が未指定の領域は最初の集計ステップで確定する
+        self.eedf_results: list[dict] | None = None
+        self._eedf_st: list[dict] = []  # 領域ごとの前計算 + 集計ストレージ
+        for reg in self.pic.eedf_regions:
+            x0, x1 = sorted((reg.p1[0], reg.p2[0]))
+            y0, y1 = sorted((reg.p1[1], reg.p2[1]))
+            auto = reg.e_max_ev is None
+            self._eedf_st.append(
+                {
+                    "x0": x0, "x1": x1, "y0": y0, "y1": y1,
+                    "bins": reg.bins,
+                    "label": reg.label,
+                    "auto": auto,               # e_max_ev 未指定 (自動決定) か
+                    "e_max": reg.e_max_ev,      # auto の間は None (最初の集計ステップで確定)
+                    "hist": None if auto else np.zeros(reg.bins),  # Σw (ビンごと)
+                    "sum_w": 0.0,      # 域内かつビン範囲内の Σw (正規化・平均エネルギーの分母)
+                    "sum_we": 0.0,     # 同 ΣwE (平均エネルギー用)
+                    "overflow_w": 0.0,  # e_max 超過分の Σw (ヒストグラム形状を歪めないよう除外)
+                }
+            )
+        # 節点集中体積 (averaged_density の規格化に使う)。
+        # xy: Σ隣接要素面積/3 (従来どおり)。rz: Σ 2π∫L_i r dA = Σ 2π(A/12)(2r_i+r_j+r_k)
+        # (線形 r の厳密積分。fem.assemble の右辺と同じ公式)。
+        # 周期境界では正準節点番号で積むため、スレーブ節点の値は 0 になる
+        if self.rz:
+            node_w = (
+                2.0 * np.pi * (self.area / 12.0)[:, None]
+                * (self._r_nodes + 3.0 * self.r_bar[:, None])
+            )
+            self._node_area = np.bincount(
+                self.tris_dep.ravel(), weights=node_w.ravel(), minlength=self.n_nodes
+            )
+        else:
+            self._node_area = np.bincount(
+                self.tris_dep.ravel(),
+                weights=np.repeat(self.area / 3.0, 3),
+                minlength=self.n_nodes,
+            )
+
+        # ---- 診断・時刻 -------------------------------------------------------
+        self.t = 0.0
+        self.step_count = 0
+        # 累計カウンタ (既存フィールドは変更せず追加のみ: フロントの後方互換)
+        self.coll_e = 0      # 電子衝突の累計
+        self.ion_events = 0  # 電離の累計
+        self.see_events = 0  # SEE 発生の累計
+        self.history: dict[str, list[float]] = {
+            k: []
+            for k in (
+                "t", "ke_e", "ke_i", "fe", "n_e", "n_i",
+                "wall_e", "wall_i", "phi_min", "phi_max",
+                "coll_e", "ion_events", "see_events", "surf_q",
+                "fn_i", "fn_events", "merged", "split",
+            )
+        }
+        self._f_immobile: dict[str, np.ndarray] = {}  # 不動種の堆積キャッシュ
+
+        # ---- 収束の判定 (prompts/137、convergence.py。周期は阻止コンデンサの集計と同じ RF の周期) ---------
+        # 場は節点を粗いブロックに体積 (_node_area。軸対称は 2πr を含む、周期境界の従節点は 0) で平均して比べる
+        self.conv = make_monitor(
+            self.pic.convergence, kind="pic",
+            rf_period_s=1.0 / self._cycle_freq if self._cycle_freq is not None else None,
+            dt=self.dt, frame_every=self.pic.frame_every,
+        )
+        self._conv_blocks = BlockMap(self.mesh.nodes, self._node_area, BLOCKS_2D) if self.conv is not None else None
+        self._conv_inv_area = np.where(self._node_area > 0.0, 1.0 / np.where(self._node_area > 0.0, self._node_area, 1.0),
+                                       0.0)
+
+        # ---- 位相別プロファイル計測 (prompts/75) -------------------------------
+        # 大規模化に向けた高速化①の土台として、1ステップ内の主要フェーズの
+        # 累積時間を常時計測する (ON/OFF切替は無し)。time.perf_counter の呼び出しは
+        # 1ステップあたり数回程度なのでオーバーヘッドは無視できる。
+        # done メッセージ (server.py) で返し、continue では区間分のみ返すよう
+        # prepare_continue でリセットする
+        self.timing: dict[str, float] = {
+            "solve": 0.0,       # ポアソン求解 (前分解済み LU の rhs 更新+solve)
+            "gather_push": 0.0,  # E 補間 + リープフロッグ押し出し
+            "walk": 0.0,        # walk 探索・境界吸収・反射・周期・SEE
+            "deposit": 0.0,     # 電荷堆積 (節点荷重ベクトルへの散布)
+            "mcc": 0.0,         # MCC 衝突 (電子・イオン)
+            "other": 0.0,       # 注入・FN放出・時間平均積算・診断記録など
+            "frame": 0.0,       # ライブフレーム用の密度集計・リスト変換
+        }
+        # walk コスト診断 (prompts/88)。h_mean_m/h_min_m はメッシュから決まる定数
+        # (継続実行でも不変)、walk_cells_est_e/i は区間平均 (run_batch 終了時に確定する)
+        self.timing["h_mean_m"] = self._h_mean
+        self.timing["h_min_m"] = self._h_min
+        self.timing["walk_cells_est_e"] = 0.0
+        self.timing["walk_cells_est_i"] = 0.0
+        self._walk_diag_sum = {"e": 0.0, "i": 0.0}  # Σ mean(|v|)·dt_species/h_mean
+        self._walk_diag_n = {"e": 0, "i": 0}        # 上のサンプル数 (frame 間隔)
+
+        # ---- 初期半ステップ後退キック (t=0 の場で v を -dt/2 へ) --------------
+        # E は vx, vy のみに作用する (vz は不変)。軸対称も同じ (回転法の速度は粒子の位置の
+        # 局所直交座標の成分なので遠心力の項は入らない。v2 の GPU PIC と同じ)
+        phi0 = self._solve_phi(self._deposit(), 0.0)
+        ex, ey = self._e_field(phi0)
+        for sp in self.species.values():
+            if sp.mobile and len(sp.x):
+                # サブサイクル時のイオンは実効時間刻み _sub·dt で後退させる
+                dt_sp = self.dt * self._sub if (sp.name == "ion" and self._sub > 1) else self.dt
+                e_at = np.stack([ex[sp.elem], ey[sp.elem]], axis=1)
+                sp.v[:, :2] -= 0.5 * dt_sp * (sp.q / sp.m) * e_at
+
+    # ---- 内部処理 -----------------------------------------------------------
+
+    def _find_rf_freq(self) -> float | None:
+        """boundaries / conductor 領域の voltage_rf / voltage_waveform から
+        位相分解の基本周波数を返す。
+
+        デュアル周波数 (prompts/49) では全成分の最小周波数 (= 基本波。低周波の
+        1周期に高周波の複数サイクルが収まる) を使う。CSV 波形 (prompts/73) の
+        freq_hz も同じ集合に加える (波形も1周期ループなので基本波として扱える)。
+        無ければ None (cycle 無効)。単一周波数のみの従来構成では従来と同じ値になる。
+        """
+        freqs: list[float] = []
+        for bc in self.project.geometry.boundaries:
+            freqs.extend(c.freq_hz for c in rf_components(bc.voltage_rf))
+            if bc.voltage_waveform is not None:
+                freqs.append(bc.voltage_waveform.freq_hz)
+        for region in self.project.geometry.regions:
+            if region.type == "conductor":
+                freqs.extend(c.freq_hz for c in rf_components(region.voltage_rf))
+                if region.voltage_waveform is not None:
+                    freqs.append(region.voltage_waveform.freq_hz)
+        return min(freqs) if freqs else None
+
+    def _phase_bin(self, t: float) -> int:
+        """時刻 t の RF 位相ビン番号 bin = floor((t mod T)/T × bins) を返す。"""
+        frac = (t % self._cycle_period) / self._cycle_period
+        return min(int(frac * self._cycle_bins), self._cycle_bins - 1)
+
+    # ---- 阻止コンデンサ (自己バイアス、prompts/134) ------------------------------------------
+
+    def _init_circuit(self, k) -> None:
+        """阻止コンデンサの回路: ψ̃ (K_ff の LU)・容量行列・節点 → 電極の表。
+
+        電極 = mesh.electrode のラベルが電極のもの (circuit.mesh_capacitor_electrodes)。粒子などの節点の電荷 f が
+        電極 j に誘導する電荷は Q_e0,j = −factor ψ̃_j·f (Green の相反定理。ψ̃_j は電極 j の節点が 1 V・ほかの
+        Dirichlet 節点が 0 V の解、factor は軸対称で 2π)。容量 C_jk は ψ_k の解での電極 j の電荷 (静電場と同じ
+        残差 Σ_{電極 j の節点} Kψ_k)。
+        """
+        self.circuit: BlockingCircuit | None = None
+        elecs = mesh_capacitor_electrodes(self.project, self.mesh)
+        if not elecs:
+            return
+        n = self.n_nodes
+        m = len(elecs)
+        self._cap_nodes = [nodes for _, nodes in elecs]
+        self._cap_rows = [np.searchsorted(self.fixed, nodes) for nodes in self._cap_nodes]
+        self._cap_factor = 2.0 * np.pi if self.rz else 1.0
+        psi = np.zeros((m, n))
+        for j, rows in enumerate(self._cap_rows):
+            vd = np.zeros(self.fixed.size)
+            vd[rows] = 1.0
+            psi[j, self.fixed] = vd
+            psi[j, self.free] = self.lu.solve(-(self.k_fd @ vd))
+        self._cap_psi = psi
+        kpsi = np.asarray(k @ psi.T)
+        c_matrix = self._cap_factor * np.array([kpsi[nodes].sum(axis=0) for nodes in self._cap_nodes])
+        period = 1.0 / self._cycle_freq if self._cycle_freq is not None else None
+        self.circuit = BlockingCircuit([spec for spec, _ in elecs], c_matrix, period)
+        self._cap_node_elec = np.full(n, -1, dtype=np.int64)
+        for j, nodes in enumerate(self._cap_nodes):
+            self._cap_node_elec[nodes] = j
+        self._cap_dq = np.zeros(m)   # このステップに電極へ流れ込んだ電荷 (軸対称は C、平面は C/m)
+
+    def _cap_add(self, n1: np.ndarray, n2: np.ndarray, w1: np.ndarray, q: np.ndarray) -> None:
+        """電荷 q を節点 n1・n2 へ重み w1・1 − w1 で分け、電極の節点の分を阻止コンデンサの電極へ積む。"""
+        m = self.circuit.m
+        for nodes, w in ((n1, w1), (n2, 1.0 - w1)):
+            e = self._cap_node_elec[nodes]
+            sel = e >= 0
+            if np.any(sel):
+                self._cap_dq += np.bincount(e[sel], weights=(q * w)[sel], minlength=m)
+
+    def _cap_edge_weight(self, ea: np.ndarray, eloc: np.ndarray, hit: np.ndarray):
+        """境界エッジ (要素 ea の頂点 eloc の対辺) の 2 つの端の節点と、当たった点の 1 つ目の端の P1 重み。
+
+        当たった点の重心座標の 2 つの端の成分を和 1 に直したもの (点の電荷の P1 射影と同じ分け方)。
+        """
+        k1, k2 = (eloc + 1) % 3, (eloc + 2) % 3
+        lam = self._bary_of(hit, ea)
+        rows = np.arange(len(ea))
+        l1 = np.maximum(lam[rows, k1], 0.0)
+        l2 = np.maximum(lam[rows, k2], 0.0)
+        s = l1 + l2
+        w1 = np.where(s > 0.0, l1 / np.where(s > 0.0, s, 1.0), 0.5)
+        return self.tris[ea, k1], self.tris[ea, k2], w1
+
+    def _edge_hit(self, ea: np.ndarray, eloc: np.ndarray, xp: np.ndarray, xn: np.ndarray) -> np.ndarray:
+        """x_prev → x_new が越えた境界エッジ (重心座標 L_eloc = 0) との交点 (線形補間)。"""
+        a, b, c, det = self.coeffs
+        aa, bb, cc, dd = a[ea, eloc], b[ea, eloc], c[ea, eloc], det[ea]
+        l0 = (aa + bb * xp[:, 0] + cc * xp[:, 1]) / dd
+        l1 = (aa + bb * xn[:, 0] + cc * xn[:, 1]) / dd
+        denom = l0 - l1
+        denom = np.where(np.abs(denom) < 1e-300, 1e-300, denom)
+        frac = np.clip(l0 / denom, 0.0, 1.0)
+        return xp + frac[:, None] * (xn - xp)
+
+    def _build_see_edges(self) -> None:
+        """境界エッジ (隣接 = -1) ごとの SEE 属性表を構築する。
+
+        エッジ両端の節点がともに γ>0 の電極/Dirichlet 辺に属する場合に、
+        γ (両端の最小値)・内向き単位法線・境界からわずかに内側へ置く
+        オフセット量を (要素, ローカルエッジ) で引ける配列に記録する。
+        """
+        self._edge_gamma: np.ndarray | None = None
+        gm_dict = self.mesh.see_gamma
+        if not gm_dict:
+            return
+        gm = np.zeros(self.n_nodes)
+        gm[np.fromiter(gm_dict.keys(), dtype=np.int64)] = np.fromiter(
+            gm_dict.values(), dtype=np.float64
+        )
+        # 境界エッジ: adjacency[t, i] == -1 (頂点 i の対辺)
+        ts, loc = np.nonzero(self.adjacency == -1)
+        n1 = self.tris[ts, (loc + 1) % 3]
+        n2 = self.tris[ts, (loc + 2) % 3]
+        n_opp = self.tris[ts, loc]
+        g_edge = np.minimum(gm[n1], gm[n2])  # 両端とも γ>0 のときのみ >0
+        if not np.any(g_edge > 0.0):
+            return
+        nodes = self.mesh.nodes
+        p1, p2, po = nodes[n1], nodes[n2], nodes[n_opp]
+        mid = 0.5 * (p1 + p2)
+        t_vec = p2 - p1
+        perp = np.stack([-t_vec[:, 1], t_vec[:, 0]], axis=1)
+        # 内向き = 対頂点の側
+        sgn = np.where(np.sum(perp * (po - mid), axis=1) >= 0.0, 1.0, -1.0)
+        nrm = perp * (sgn / np.linalg.norm(perp, axis=1))[:, None]
+        h = np.abs(np.sum((po - mid) * nrm, axis=1))  # エッジから対頂点までの高さ
+
+        m = len(self.tris)
+        self._edge_gamma = np.zeros((m, 3))
+        self._edge_normal = np.zeros((m, 3, 2))
+        self._edge_delta = np.zeros((m, 3))
+        self._edge_gamma[ts, loc] = g_edge
+        self._edge_normal[ts, loc] = nrm
+        self._edge_delta[ts, loc] = 1e-3 * h  # 境界からわずかに内側
+
+    def _build_boundary_edges(self) -> None:
+        """鏡面反射・周期の境界メッシュエッジ表を構築する。
+
+        鏡面反射エッジは pic.reflect_edges と boundaries の symmetry 指定の和集合。
+        periodic 指定の対辺は周期ラップ対象とする。表の構築は particles.py の
+        _build_boundary_tables (trace と共通) に委譲する。
+        """
+        self._edge_reflect: np.ndarray | None = None
+        self._edge_periodic: np.ndarray | None = None
+        refl = set(self.pic.reflect_edges)
+        periodic_pairs: list[tuple[int, int]] = []
+        for bc in self.project.geometry.boundaries:
+            if bc.type == "symmetry":
+                refl.update(bc.edges)
+            elif bc.type == "periodic":
+                periodic_pairs.append((bc.edges[0], bc.edges[1]))
+        tables = _build_boundary_tables(
+            self.project.geometry.domain.polygon, self.mesh, self.adjacency,
+            sorted(refl), periodic_pairs,
+        )
+        if tables is None:
+            return
+        if tables.reflect is not None:
+            self._edge_reflect = tables.reflect
+            self._refl_normal = tables.refl_normal
+            self._refl_point = tables.refl_point  # エッジ上の基準点 (符号付き距離用)
+        if tables.periodic is not None:
+            self._edge_periodic = tables.periodic
+            self._per_shift = tables.shift
+
+    def _apply_reflection(
+        self,
+        x_new: np.ndarray,
+        v_new: np.ndarray,
+        elem: np.ndarray,
+        absorbed: np.ndarray,
+        b_elem: np.ndarray,
+        b_loc: np.ndarray,
+        l_out: np.ndarray | None = None,
+    ) -> None:
+        """反射エッジで検出された粒子を鏡面反射する (全引数を in-place 更新)。
+
+        位置は境界線について折り返し、速度は法線成分 (vx, vy のみ) を反転する。
+        反射後に所属要素を再探索し、コーナーで別の壁に到達した粒子は次の反復で
+        処理する。反射エッジ以外の壁に達した粒子は absorbed のまま残す
+        (通常の壁吸収として扱われる)。
+        """
+        for _ in range(8):
+            idx = np.nonzero(absorbed)[0]
+            if idx.size == 0:
+                return
+            ea, el = b_elem[idx], b_loc[idx]
+            refl = self._edge_reflect[ea, el]
+            if not np.any(refl):
+                return
+            r_idx = idx[refl]
+            ea, el = ea[refl], el[refl]
+            nrm = self._refl_normal[ea, el]
+            # 符号付き距離 d < 0 = 境界の外側。折り返して境界内へ戻す
+            d = np.sum((x_new[r_idx] - self._refl_point[ea, el]) * nrm, axis=1)
+            x_new[r_idx] -= 2.0 * np.minimum(d, 0.0)[:, None] * nrm
+            vn = np.sum(v_new[r_idx, :2] * nrm, axis=1)
+            v_new[r_idx, :2] -= 2.0 * vn[:, None] * nrm
+            # 反射後の所属要素を境界要素から再探索 (再度壁に達したら次の反復へ)
+            sub_l = None if l_out is None else np.empty((r_idx.size, 3))
+            e2, a2, be2, bl2 = _walk_step(
+                self.coeffs, self.adjacency, ea, x_new[r_idx], sub_l,
+                packed=self._coeffs_packed,
+            )
+            elem[r_idx] = e2
+            absorbed[r_idx] = a2
+            b_elem[r_idx] = be2
+            b_loc[r_idx] = bl2
+            if l_out is not None:
+                l_out[r_idx] = sub_l
+
+    def _apply_periodic(
+        self,
+        x_new: np.ndarray,
+        elem: np.ndarray,
+        absorbed: np.ndarray,
+        b_elem: np.ndarray,
+        b_loc: np.ndarray,
+        l_out: np.ndarray | None = None,
+    ) -> bool:
+        """周期エッジで検出された粒子を反対側へラップする (in-place 更新)。
+
+        位置を周期ベクトル分平行移動し (速度不変)、所属要素はラップした
+        少数粒子のみ _locate_initial (総当たり) で再特定して walk で確定する。
+        壁カウンタには計上しない。ラップ対象を処理した場合 True を返す
+        (コーナーで別の壁に達した粒子は呼び出し側の反復で処理する)。
+        """
+        idx = np.nonzero(absorbed)[0]
+        if idx.size == 0:
+            return False
+        per = self._edge_periodic[b_elem[idx], b_loc[idx]]
+        if not np.any(per):
+            return False
+        p_idx = idx[per]
+        ea, el = b_elem[p_idx], b_loc[p_idx]
+        x_new[p_idx] += self._per_shift[ea, el]
+        elem0 = _locate_initial(self.coeffs, x_new[p_idx])
+        sub_l = None if l_out is None else np.empty((p_idx.size, 3))
+        e2, a2, be2, bl2 = _walk_step(
+            self.coeffs, self.adjacency, elem0, x_new[p_idx], sub_l,
+            packed=self._coeffs_packed,
+        )
+        elem[p_idx] = e2
+        absorbed[p_idx] = a2
+        b_elem[p_idx] = be2
+        b_loc[p_idx] = bl2
+        if l_out is not None:
+            l_out[p_idx] = sub_l
+        return True
+
+    def _accumulate_surface_charge(
+        self,
+        sp: PicSpecies,
+        elem_new: np.ndarray,
+        l_new: np.ndarray,
+        hit: np.ndarray,
+    ) -> None:
+        """誘電体に吸収された粒子の電荷 w·q を表面電荷 Q_surf へ加算する。
+
+        吸収位置 (進入した誘電体要素内) の P1 重心座標重みで節点へ散布する
+        (点電荷の P1 射影と同じ扱い)。位置は表面の直内側 (高々1ステップの
+        移動量) なので重みはほぼ表面節点に集中するが、進入要素の内部節点にも
+        僅かに載る近似である。周期境界では正準節点番号 (tris_dep) で積む。
+        """
+        contrib = (sp.q * sp.w[hit])[:, None] * l_new[hit]
+        self.q_surf += np.bincount(
+            self.tris_dep[elem_new[hit]].ravel(),
+            weights=contrib.ravel(),
+            minlength=self.n_nodes,
+        )
+
+    def _emit_see_dielectric(
+        self,
+        sp: PicSpecies,
+        v_new: np.ndarray,
+        elem_new: np.ndarray,
+        l_new: np.ndarray,
+        hit: np.ndarray,
+    ) -> None:
+        """γ>0 の誘電体へ進入して吸収されたイオンから確率 γ で二次電子を放出する。
+
+        固体吸収経路には境界エッジ (法線) が無いため、放出速度は入射イオン速度の
+        単位ベクトルの逆向きに see_energy_ev を与える近似とする (面内2成分 + vz)。
+        位置はプッシュ前のイオン位置 (直前までいたプラズマ側の要素内)、所属要素も
+        プッシュ前のものを流用する (locate 不要)。重みは吸収イオンと同じ。
+
+        表面電荷の収支整合: 電子が表面から放出される分だけ表面は正に帯電するため、
+        +e·w をイオン吸収と同じ P1 射影 (進入要素の重心座標) で Q_surf へ加算する。
+        電極 γ 由来の既存 SEE (_emit_see) は表面電荷管理外なので変更しない。
+        sp.x / sp.elem は更新前 (プッシュ前) の状態であることを前提とする。
+        """
+        idx = np.nonzero(hit)[0]
+        gam = self._solid_gamma[elem_new[idx]]
+        cand = gam > 0.0
+        if not np.any(cand):
+            return
+        c_idx = idx[cand]
+        accept = self._see_rng.random(len(c_idx)) < gam[cand]
+        if not np.any(accept):
+            return
+        c_idx = c_idx[accept]
+
+        # 放出速度 = 入射イオン速度 (3成分) の逆向き単位ベクトル × SEE 速さ。
+        # 速度ゼロの入射 (通常あり得ない) は方向が定義できないためスキップする
+        v_in = v_new[c_idx]
+        speed = np.sqrt(v_in[:, 0] ** 2 + v_in[:, 1] ** 2 + v_in[:, 2] ** 2)
+        ok = speed > 0.0
+        c_idx, v_in, speed = c_idx[ok], v_in[ok], speed[ok]
+        if c_idx.size == 0:
+            return
+        v_see = -self._see_speed * v_in / speed[:, None]
+
+        pos = sp.x[c_idx]        # プッシュ前の位置 (プラズマ側)
+        elems = sp.elem[c_idx]   # プッシュ前の所属要素
+        el = self.species["electron"]
+        el.x = np.concatenate([el.x, pos])
+        el.v = np.concatenate([el.v, v_see])
+        el.w = np.concatenate([el.w, sp.w[c_idx]])
+        el.elem = np.concatenate([el.elem, elems])
+        self._bary_append(el, self._bary_of(pos, elems))
+        self.see_events += len(c_idx)
+
+        # 表面電荷の収支: 放出電子分 +e·w を吸収位置と同じ P1 射影で加算する
+        contrib = (QE * sp.w[c_idx])[:, None] * l_new[c_idx]
+        self.q_surf += np.bincount(
+            self.tris_dep[elem_new[c_idx]].ravel(),
+            weights=contrib.ravel(),
+            minlength=self.n_nodes,
+        )
+
+    def _collect_ions(
+        self,
+        sp: PicSpecies,
+        x_new: np.ndarray,
+        v_new: np.ndarray,
+        absorbed: np.ndarray,
+        b_elem: np.ndarray,
+        b_loc: np.ndarray,
+        removed: np.ndarray,
+    ) -> None:
+        """吸収イオンのうちコレクタ線分に達したものを記録する (IEDF/IADF)。
+
+        吸収位置は既存の補間位置を使う: 壁吸収 (walk 検出) は境界エッジ L=0 との
+        線形補間、誘電体表面吸収は現在位置 (prompts/24 と同じ扱い)。
+        エネルギーは衝突時速度 (3成分) から ½m|v|²/e [eV]。入射角は法線に対する
+        面内角 [deg] で、符号は接線 (p1→p2) 方向成分の符号 (範囲 (-90, 90))。
+        法線は入射イオンと逆向き成分を持つ側 (表面正面) を基準とするため |v·n| を使う。
+        sp.x は更新前 (プッシュ前) の位置であることを前提とする。
+        """
+        idx = np.nonzero(removed)[0]
+        if idx.size == 0:
+            return
+        pos = np.empty((idx.size, 2))
+        wall = absorbed[idx]
+        if np.any(wall):
+            # 壁吸収: 越えた境界エッジの重心座標 L=0 を x_prev → x_new で線形補間
+            w_idx = idx[wall]
+            pos[wall] = self._edge_hit(b_elem[w_idx], b_loc[w_idx], sp.x[w_idx], x_new[w_idx])
+        if not np.all(wall):
+            # 誘電体表面吸収: 現在位置 (侵入直前〜現在の間で良い)
+            pos[~wall] = x_new[idx[~wall]]
+
+        # 各コレクタ線分との距離 (法線方向) と区間 (接線方向の射影) の判定。
+        # 1つのイオンが複数コレクタに同時該当する場合は両方に記録する
+        for st in self._collectors_st:
+            d = pos - st["p1"]
+            proj = d[:, 0] * st["tan"][0] + d[:, 1] * st["tan"][1]
+            dist = np.abs(d[:, 0] * st["nrm"][0] + d[:, 1] * st["nrm"][1])
+            sel = (dist <= st["tol"]) & (proj >= 0.0) & (proj <= st["len"])
+            if not np.any(sel):
+                continue
+            s_idx = idx[sel]
+            vel = v_new[s_idx]
+            wgt = sp.w[s_idx].astype(np.float64)
+            k = len(s_idx)
+            st["count"] += k
+            st["weight"] += float(wgt.sum())
+
+            # サンプル上限 (コレクタごと) 到達後は count / total_weight のみ加算する
+            room = COLLECTOR_MAX_SAMPLES - st["samples"]
+            if room <= 0:
+                continue
+            if k > room:
+                vel, wgt, k = vel[:room], wgt[:room], room
+            e_ev = 0.5 * sp.m * (vel[:, 0] ** 2 + vel[:, 1] ** 2 + vel[:, 2] ** 2) / QE
+            vt = vel[:, 0] * st["tan"][0] + vel[:, 1] * st["tan"][1]
+            vn = vel[:, 0] * st["nrm"][0] + vel[:, 1] * st["nrm"][1]
+            ang = np.degrees(np.arctan2(vt, np.abs(vn)))
+            st["e"].append(e_ev)
+            st["a"].append(ang)
+            st["w"].append(wgt)
+            st["samples"] += k
+
+    def _collector_data(self) -> list[dict] | None:
+        """各コレクタの記録を dict のリストにまとめる (collectors と同順)。"""
+        if not self._collectors_st:
+            return None
+        empty = np.zeros(0)
+        return [
+            {
+                "count": st["count"],
+                "total_weight": st["weight"],
+                "energies_ev": np.concatenate(st["e"]) if st["e"] else empty,
+                "angles_deg": np.concatenate(st["a"]) if st["a"] else empty,
+                "weights": np.concatenate(st["w"]) if st["w"] else empty,
+                "truncated": st["count"] > st["samples"],
+            }
+            for st in self._collectors_st
+        ]
+
+    # ---- EEDF/EEPF 領域 (prompts/85) -------------------------------------------
+
+    def _accumulate_eedf(self) -> None:
+        """1ステップ分、各EEDF領域内の電子を重み付きエネルギーヒストグラムへ加算する
+        (時間平均区間のみ呼ばれる。領域未設定ならコストゼロで即 return)。
+
+        矩形内判定は min/max のベクトル化比較 (軸平行のみ対応)。e_max_ev 未指定の
+        領域は最初にここへ来たステップで「矩形内電子の最大エネルギー×1.2」
+        (電子がいなければ既定30eV) に確定し、以後は固定する。確定後の範囲外
+        (E > e_max) はヒストグラムへは畳まずオーバーフロー重みへ加算する
+        (分布の形を歪めないため)。
+        """
+        if not self._eedf_st:
+            return
+        el = self.species["electron"]
+        if len(el.x) == 0:
+            return
+        x, y = el.x[:, 0], el.x[:, 1]
+        e_all: np.ndarray | None = None  # 領域が複数あっても1回だけ計算して使い回す
+        for st in self._eedf_st:
+            mask = (x >= st["x0"]) & (x <= st["x1"]) & (y >= st["y0"]) & (y <= st["y1"])
+            if not np.any(mask):
+                continue
+            if e_all is None:
+                v = el.v
+                e_all = 0.5 * ME * (v[:, 0] ** 2 + v[:, 1] ** 2 + v[:, 2] ** 2) / QE
+            e_sel = e_all[mask]
+            w_sel = el.w[mask]
+            if st["auto"] and st["hist"] is None:
+                e_max = float(e_sel.max()) * 1.2 if e_sel.size else 30.0
+                st["e_max"] = e_max if e_max > 0.0 else 30.0
+                st["hist"] = np.zeros(st["bins"])
+            e_max = st["e_max"]
+            in_range = e_sel <= e_max
+            if np.any(in_range):
+                idx = np.minimum(
+                    (e_sel[in_range] / e_max * st["bins"]).astype(np.int64), st["bins"] - 1
+                )
+                st["hist"] += np.bincount(idx, weights=w_sel[in_range], minlength=st["bins"])
+                st["sum_w"] += float(w_sel[in_range].sum())
+                st["sum_we"] += float((w_sel[in_range] * e_sel[in_range]).sum())
+            if not np.all(in_range):
+                st["overflow_w"] += float(w_sel[~in_range].sum())
+
+    def _eedf_data(self) -> list[dict] | None:
+        """各EEDF領域の集計結果を dict のリストにまとめる (eedf_regions と同順、prompts/85)。
+
+        f は EEDF [eV^-1] (Σ f_i·dE = 1 に正規化。オーバーフローは除いた「ヒストグラム化
+        できた」重みのみを分母にするので、分布の形はそのまま数値積分1に一致する)。
+        Σw=0 (電子が一度も入らなかった) 領域は f 全ゼロ・mean/t_eff も 0 で返す。
+        """
+        if not self._eedf_st:
+            return None
+        n_samples = self._accum_count
+        out = []
+        for st in self._eedf_st:
+            bins = st["bins"]
+            e_max = st["e_max"] if st["e_max"] is not None else 30.0
+            hist = st["hist"] if st["hist"] is not None else np.zeros(bins)
+            d_e = e_max / bins
+            e_centers = (np.arange(bins) + 0.5) * d_e
+            sum_w = st["sum_w"]
+            if sum_w > 0.0:
+                f = hist / (sum_w * d_e)
+                mean_e = st["sum_we"] / sum_w
+            else:
+                f = np.zeros(bins)
+                mean_e = 0.0
+            denom = sum_w + st["overflow_w"]
+            overflow_frac = st["overflow_w"] / denom if denom > 0.0 else 0.0
+            out.append(
+                {
+                    "label": st["label"],
+                    "e_centers": e_centers,
+                    "f": f,
+                    "mean_energy_ev": mean_e,
+                    "t_eff_ev": (2.0 / 3.0) * mean_e,
+                    "total_weight": sum_w,
+                    "overflow_frac": overflow_frac,
+                    "n_samples": n_samples,
+                }
+            )
+        return out
+
+    def _emit_see(
+        self,
+        sp: PicSpecies,
+        x_new: np.ndarray,
+        b_elem: np.ndarray,
+        b_loc: np.ndarray,
+        absorbed: np.ndarray,
+    ) -> None:
+        """γ>0 の電極エッジに吸収されたイオンから確率 γ で二次電子を放出する。
+
+        位置 = 吸収位置 (境界エッジとの交点をわずかに内側へ)、
+        速度 = 内向き法線方向に see_energy_ev、重み = 吸収イオンと同じ。
+        sp.x は更新前 (プッシュ前) の位置であることを前提とする。
+        """
+        idx = np.nonzero(absorbed)[0]
+        ea = b_elem[idx]
+        eloc = b_loc[idx]
+        gam = self._edge_gamma[ea, eloc]
+        cand = gam > 0.0
+        if not np.any(cand):
+            return
+        c_idx = idx[cand]
+        ea, eloc = ea[cand], eloc[cand]
+        accept = self._see_rng.random(len(c_idx)) < gam[cand]
+        if not np.any(accept):
+            return
+        c_idx, ea, eloc = c_idx[accept], ea[accept], eloc[accept]
+
+        # 吸収位置: 越えたエッジの重心座標 L=0 を x_prev → x_new で線形補間
+        x_hit = self._edge_hit(ea, eloc, sp.x[c_idx], x_new[c_idx])
+        if self.circuit is not None:
+            # 電極から電子が出ていく分 +e·w を阻止コンデンサの電極へ (prompts/134)
+            self._cap_add(*self._cap_edge_weight(ea, eloc, x_hit), QE * sp.w[c_idx])
+
+        nrm = self._edge_normal[ea, eloc]
+        pos = x_hit + self._edge_delta[ea, eloc][:, None] * nrm
+        el = self.species["electron"]
+        el.x = np.concatenate([el.x, pos])
+        # SEE 電子は法線方向のみ (vz = 0)
+        v_see = np.column_stack([self._see_speed * nrm, np.zeros(len(nrm))])
+        el.v = np.concatenate([el.v, v_see])
+        el.w = np.concatenate([el.w, sp.w[c_idx]])
+        el.elem = np.concatenate([el.elem, ea])
+        self._bary_append(el, self._bary_of(pos, ea))
+        self.see_events += len(c_idx)
+
+    def _sample_uniform(self, rng: np.random.Generator, n: int):
+        """ドメイン内 (メッシュ要素上 = 電極領域を除く) の一様分布サンプリング。
+
+        要素を体積比例 (xy: 面積、rz: 2πr̄A) で選び、要素内は重心座標の一様分布で
+        配置する。所属要素が同時に確定するので walk 初期化が不要。
+        誘電体 (固体) 要素は粒子が入れないため装荷対象から除外する。
+        rz では要素内の r 依存 (∝r) を r̄ で代表する近似 (要素サイズ ≪ r で厳密に
+        一様密度へ収束。軸近傍の要素では僅かに軸寄りが過剰になる)。
+        """
+        if self._solid_elem is None:
+            p_elem = self.elem_vol / self.elem_vol.sum()
+            elem = rng.choice(len(self.tris), size=n, p=p_elem).astype(np.int64)
+        else:
+            loadable = np.nonzero(~self._solid_elem)[0]
+            p_elem = self.elem_vol[loadable] / self.elem_vol[loadable].sum()
+            elem = loadable[rng.choice(len(loadable), size=n, p=p_elem)].astype(np.int64)
+        r1 = np.sqrt(rng.random(n))
+        r2 = rng.random(n)
+        pts = self.mesh.nodes[self.tris[elem]]  # (n, 3, 2)
+        x = (
+            (1.0 - r1)[:, None] * pts[:, 0]
+            + (r1 * (1.0 - r2))[:, None] * pts[:, 1]
+            + (r1 * r2)[:, None] * pts[:, 2]
+        )
+        return x, elem
+
+    def _sample_radial(self, rng: np.random.Generator, n: int):
+        """半径に比例した重み (prompts/136) の初めの装荷の位置。
+
+        要素を面積比例で選び要素内は一様に引いた候補を、r/(r + r0) の確率で採る。重み c (r + r0) と
+        組み合わせると密度が一様になる (要素内の r 依存も厳密。軸の近くで重みが 0 にならないよう r0 を足す)。
+        """
+        loadable = (np.arange(len(self.tris)) if self._solid_elem is None
+                    else np.nonzero(~self._solid_elem)[0])
+        p_elem = self.area[loadable] / self.area[loadable].sum()
+        xs, es = [], []
+        need = n
+        while need > 0:
+            m = max(1024, int(need * 1.5) + 64)
+            elem = loadable[rng.choice(len(loadable), size=m, p=p_elem)].astype(np.int64)
+            r1 = np.sqrt(rng.random(m))
+            r2 = rng.random(m)
+            pts = self.mesh.nodes[self.tris[elem]]
+            x = (
+                (1.0 - r1)[:, None] * pts[:, 0]
+                + (r1 * (1.0 - r2))[:, None] * pts[:, 1]
+                + (r1 * r2)[:, None] * pts[:, 2]
+            )
+            r = x[:, self.ridx]
+            ok = rng.random(m) * (r + self._rw_r0) < r
+            take = min(int(ok.sum()), need)
+            xs.append(x[ok][:take])
+            es.append(elem[ok][:take])
+            need -= take
+        return np.concatenate(xs), np.concatenate(es)
+
+    def _pop_control(self, push_ions: bool) -> None:
+        """半径に比例した重みの分割・併合 (prompts/136)。イオンは押したステップだけ。"""
+        for sp in self.species.values():
+            if not sp.mobile or (sp.name == "ion" and not push_ions):
+                continue
+            if self._pop_control_species(sp) and sp.name == "ion":
+                self._f_ion_cache = None
+
+    def _pop_control_species(self, sp: PicSpecies) -> bool:
+        """種 sp の重みを目標 w_t = c (r + r0) の [1/2, 2] 倍に寄せる。変えたら True。
+
+        - 分割: w > 2 w_t の粒子を同じ位置・速度の m = round(w/w_t) 個 (上限 RW_MAX_SPLIT) に等分する
+          (電荷・運動量・エネルギー・電荷堆積が厳密に同じ)。親が残りの重みを持つ。
+        - 併合: w < w_t/2 の粒子を同じ要素の軽い粒子と対にし (要素の番号の順に隣どうし)、重み w_a + w_b の
+          1 個にする。位置は重み付き平均 (同じ要素の中なので P1 の電荷堆積が厳密に同じ)、速度は重みに比例した
+          確率で一方のもの (運動量・エネルギーは期待値で保存、速度分布を歪めない。Teunissen & Ebert 2014)。
+        """
+        n = len(sp.x)
+        if n == 0:
+            return False
+        wt = self._rw_c * (sp.x[:, self.ridx] + self._rw_r0)
+        ratio = sp.w / wt
+        heavy = np.nonzero(ratio > 2.0)[0]
+        light = np.nonzero(ratio < 0.5)[0]
+        if heavy.size == 0 and light.size < 2:
+            return False
+        bary = self._bary_cached(sp)
+        dead = np.zeros(0, dtype=np.int64)
+        if light.size >= 2:
+            order = np.argsort(sp.elem[light], kind="stable")
+            lo = light[order]
+            e = sp.elem[lo]
+            same_next = np.r_[e[1:] == e[:-1], False]
+            start = np.r_[True, ~same_next[:-1]]
+            first = np.maximum.accumulate(np.where(start, np.arange(lo.size), 0))
+            k = np.nonzero(((np.arange(lo.size) - first) % 2 == 0) & same_next)[0]
+            if k.size:
+                a, b = lo[k], lo[k + 1]
+                wa, wb = sp.w[a], sp.w[b]
+                tot = wa + wb
+                fa = (wa / tot)[:, None]
+                sp.x[a] = fa * sp.x[a] + (1.0 - fa) * sp.x[b]
+                bary[a] = fa * bary[a] + (1.0 - fa) * bary[b]
+                pick_b = self._rw_rng.random(a.size) * tot >= wa
+                sp.v[a[pick_b]] = sp.v[b[pick_b]]
+                sp.w[a] = tot
+                dead = b
+        if heavy.size:
+            m = np.minimum(np.floor(ratio[heavy] + 0.5), RW_MAX_SPLIT).astype(np.int64)
+            q = sp.w[heavy] / m
+            rep = m - 1
+            src = np.repeat(heavy, rep)
+            x_new, v_new, e_new, l_new = sp.x[src], sp.v[src], sp.elem[src], bary[src]
+            w_new = np.repeat(q, rep)
+            sp.w[heavy] = sp.w[heavy] - q * rep
+        if dead.size:
+            self._remove_particles(sp, dead)
+            self.merge_removed += int(dead.size)
+        if heavy.size:
+            self._append_species_buffered(sp, x_new, v_new, w_new, e_new, l_new)
+            self.split_added += len(w_new)
+        return True
+
+    @staticmethod
+    def _remove_particles(sp: PicSpecies, idx: np.ndarray) -> None:
+        """粒子 idx を消す (末尾の生きている粒子をその位置へ移して詰める。O(消す数)、並びは変わる)。"""
+        n = len(sp.x)
+        d = np.unique(idx)
+        n_new = n - d.size
+        holes = d[d < n_new]
+        tail = np.arange(n_new, n)
+        movers = tail[~np.isin(tail, d)]
+        bary_ok = sp.bary is not None and len(sp.bary) == n
+        for arr in (sp.x, sp.v, sp.w, sp.elem) + ((sp.bary,) if bary_ok else ()):
+            arr[holes] = arr[movers]
+        sp.x, sp.v, sp.w, sp.elem = sp.x[:n_new], sp.v[:n_new], sp.w[:n_new], sp.elem[:n_new]
+        sp.bary = sp.bary[:n_new] if bary_ok else None
+        sp.nidx = None
+
+    def _bary_of(self, x: np.ndarray, elem: np.ndarray) -> np.ndarray:
+        """位置・所属要素から P1 重心座標 (n, 3) を計算する。"""
+        a, b, c, det = self.coeffs
+        return (a[elem] + b[elem] * x[:, 0:1] + c[elem] * x[:, 1:2]) / det[elem][:, None]
+
+    def _bary_cached(self, sp: PicSpecies) -> np.ndarray:
+        """種の重心座標キャッシュを返す (無効なら再計算して保存)。"""
+        l = sp.bary
+        if l is None or len(l) != len(sp.x):
+            l = self._bary_of(sp.x, sp.elem)
+            sp.bary = l
+        return l
+
+    @staticmethod
+    def _bary_append(sp: PicSpecies, l_new: np.ndarray) -> None:
+        """粒子追加後にキャッシュへ重心座標行を追記する (不整合なら破棄して遅延再計算)。"""
+        if sp.bary is not None and len(sp.bary) + len(l_new) == len(sp.x):
+            sp.bary = np.concatenate([sp.bary, l_new])
+        else:
+            sp.bary = None
+
+    def _append_species_buffered(
+        self,
+        sp: PicSpecies,
+        x_new: np.ndarray,
+        v_new: np.ndarray,
+        w_new: np.ndarray,
+        elem_new: np.ndarray,
+        bary_new: np.ndarray,
+    ) -> None:
+        """粒子をpush+walkバッファの余剰容量へ追記する。
+
+        MCC電離では毎ステップ少数の粒子を追加するため、np.concatenateで既存粒子
+        全体を毎回コピーすると粒子数に比例したコストになる。現在状態の背後にある
+        バッファに空きがあれば末尾だけを書き、無ければ同じ種の予備バッファへ移す。
+        どちらも使えない場合だけ従来のconcatenateへフォールバックする。
+        """
+        n_add = len(x_new)
+        if n_add == 0:
+            return
+        n_old = len(sp.x)
+        n_total = n_old + n_add
+        pool = self._push_walk_buffers.get(sp.name, [])
+
+        def append_array(
+            current: np.ndarray, addition: np.ndarray, buffer_index: int
+        ) -> np.ndarray:
+            # 現在状態の基底バッファに余裕があれば既存部分をコピーしない。
+            for buf in pool:
+                target = buf[buffer_index]
+                if np.shares_memory(target, current) and len(target) >= n_total:
+                    target[n_old:n_total] = addition
+                    return target[:n_total]
+            # 予備バッファへ移す場合も新規確保はせず、既存容量を再利用する。
+            for buf in pool:
+                target = buf[buffer_index]
+                if len(target) >= n_total:
+                    target[:n_old] = current
+                    target[n_old:n_total] = addition
+                    return target[:n_total]
+            return np.concatenate([current, addition])
+
+        bary_old = sp.bary
+        sp.x = append_array(sp.x, x_new, 1)
+        sp.v = append_array(sp.v, v_new, 0)
+        sp.w = append_array(sp.w, w_new, 2)
+        sp.elem = append_array(sp.elem, elem_new, 3)
+        if bary_old is not None and len(bary_old) == n_old:
+            sp.bary = append_array(bary_old, bary_new, 7)
+        else:
+            sp.bary = None
+        sp.nidx = None
+
+    def _nidx_cached(self, sp: PicSpecies) -> np.ndarray:
+        """種の所属要素節点番号 tris_dep[elem] を返す (キャッシュが無効なら再計算)。
+
+        密度積算 (ステップ終端) と次ステップの電荷堆積は同じ粒子状態を見るので、
+        キャッシュにより gather を1回に減らせる。周期境界では正準化された
+        節点番号 (スレーブ→マスター置換済み) を使うため、堆積は自動的に整合する。
+        """
+        ni = sp.nidx
+        if ni is None or len(ni) != len(sp.elem):
+            ni = self.tris_dep[sp.elem]
+            sp.nidx = ni
+        return ni
+
+    def _deposit_species(self, sp: PicSpecies) -> np.ndarray:
+        """1種の電荷を P1 形状関数 (重心座標) の重みで節点へ散布する。
+
+        f_i = Σ_p w_p q_p L_i(x_p)。numba があれば逐次 njit ループ (add.at 相当)、
+        なければ np.bincount で散布する (どちらも粒子順の逐次加算と等価な決定的
+        処理。bincount を並列化しない理由は _numba_kernels.py のモジュール docstring
+        を参照)。重心座標は walk のキャッシュを再利用する。
+        """
+        l = self._bary_cached(sp)
+        if _numba_kernels.HAVE_NUMBA:
+            # tris_dep[elem] の (n,3) 中間配列を作らず、カーネル内で所属要素から
+            # 正準化済み節点番号を直接参照する。粒子順の加算順序は従来と同じ。
+            return _numba_kernels.deposit_from_elements(
+                self.tris_dep,
+                sp.elem,
+                l,
+                sp.q,
+                sp.w,
+                self.n_nodes,
+            )
+        nidx = self._nidx_cached(sp)
+        contrib = (sp.q * sp.w)[:, None] * l
+        return np.bincount(nidx.ravel(), weights=contrib.ravel(), minlength=self.n_nodes)
+
+    def _deposit(self) -> np.ndarray:
+        """全種の電荷堆積 (不動種はキャッシュを再利用)。
+
+        イオンサブサイクリング (prompts/50) 中はイオンが休止ステップで動かない
+        ため、堆積ベクトルをキャッシュして再利用する (イオン配列が変わる箇所で
+        _f_ion_cache = None に無効化される)。
+        """
+        f = np.zeros(self.n_nodes)
+        for sp in self.species.values():
+            if len(sp.x) == 0:
+                continue
+            if not sp.mobile:
+                if sp.name not in self._f_immobile:
+                    self._f_immobile[sp.name] = self._deposit_species(sp)
+                f += self._f_immobile[sp.name]
+            elif sp.name == "ion" and self._sub > 1:
+                if self._f_ion_cache is None:
+                    self._f_ion_cache = self._deposit_species(sp)
+                f += self._f_ion_cache
+            else:
+                f += self._deposit_species(sp)
+        return f
+
+    def _dirichlet_values(self, t: float) -> np.ndarray:
+        """時刻 t の Dirichlet 値 V(t) = V_dc + Σ_k A_k sin(ω_k t + φ_k) + V_wf(t)。
+
+        デュアル周波数対応 (prompts/49): rf_* は (n_fixed, K) 行列で、成分和を取る。
+        CSV 波形 (prompts/73) は種類数が少ない想定なので、波形ごとに1回だけ
+        _eval_waveform を呼び、節点→波形インデックス (self._wf_index) で展開する。
+        """
+        v = self.v_dc + np.sum(
+            self.rf_amp * np.sin(self.rf_omega * t + self.rf_phase), axis=1
+        )
+        if self._waveforms:
+            wf_vals = np.array(
+                [_eval_waveform(wf.phase, wf.v, wf.freq_hz, t) for wf in self._waveforms]
+            )
+            mask = self._wf_index >= 0
+            v[mask] += wf_vals[self._wf_index[mask]]
+        return v
+
+    def _solve_phi(self, f_dep: np.ndarray, t: float) -> np.ndarray:
+        """ポアソン求解。前分解済み LU で右辺のみ更新して解く (再分解しない)。
+
+        阻止コンデンサの電極は、節点の電荷 f が誘導する電荷 Q_e0 = −factor ψ̃·f から回路が電位を決めてから
+        解く (circuit.BlockingCircuit.solve_induced。Poisson は 1 回)。
+        """
+        v = np.zeros(self.n_nodes)
+        vd = self._dirichlet_values(t)
+        if self.rz:
+            # 軸対称: リング電荷 Q [C] の P1 射影は f_i = Q·L_i/(2π)
+            # (fem.assemble は弱形式の 2π を両辺で落とした規約のため。q_surf も同様)
+            f_dep = f_dep / (2.0 * np.pi)
+        f = self.f_static + f_dep
+        if self._solid_elem is not None:
+            # 誘電体の蓄積表面電荷を恒常的に加算する (誘電体なしの経路は数値不変)
+            f = f + (self.q_surf / (2.0 * np.pi) if self.rz else self.q_surf)
+        if self.circuit is not None:
+            v_src = np.array([vd[rows[0]] for rows in self._cap_rows])
+            v_e = self.circuit.solve_induced(-self._cap_factor * (self._cap_psi @ f), v_src)
+            for rows, value in zip(self._cap_rows, v_e):
+                vd[rows] = value
+        v[self.fixed] = vd
+        rhs = f[self.free] - self.k_fd @ vd
+        v[self.free] = self.lu.solve(rhs)
+        if self.canon is not None:
+            v = v[self.canon]     # スレーブ節点へマスター値をコピー (表示互換)
+            v[self.fixed] = vd    # Dirichlet 値は厳密に保持
+        return v
+
+    def _e_field(self, phi: np.ndarray):
+        """要素ごとの E = -∇φ (P1 なので要素内一定)。"""
+        _, b, c, det = self.coeffs
+        vt = phi[self.tris]  # (M, 3)
+        ex = -np.sum(vt * b, axis=1) / det
+        ey = -np.sum(vt * c, axis=1) / det
+        return ex, ey
+
+    def _injection_velocities(self) -> np.ndarray:
+        """注入粒子の速度。maxwell は持続 rng でステップごとに独立にサンプルする。"""
+        inj = self.pic.injection
+        em = inj.emitter
+        sp = self.species[inj.species]
+        if em.energy_dist == "maxwell":
+            angle = math.radians(em.direction_deg)
+            speed = math.sqrt(2.0 * em.energy_ev * QE / sp.m) if em.energy_ev > 0 else 0.0
+            drift = speed * np.array([math.cos(angle), math.sin(angle), 0.0])
+            sigma = math.sqrt(em.temperature_ev * QE / sp.m)
+            # 2d3v: 熱速度成分は3成分で抽選する
+            return drift[None, :] + self._inj_rng.normal(0.0, sigma, size=(em.n, 3))
+        # mono: フェーズ2 の2成分速度に vz = 0 を付加
+        base = self._inj_vel_base
+        return np.column_stack([base, np.zeros(len(base))])
+
+    def _inject(self, ex: np.ndarray, ey: np.ndarray) -> None:
+        """エミッタ定常注入。初期半ステップ後退キックを適用して追加する。"""
+        inj = self.pic.injection
+        sp = self.species[inj.species]
+        elem = self._inj_elem
+        v = self._injection_velocities()
+        e_at = np.stack([ex[elem], ey[elem]], axis=1)
+        # イオン注入 + サブサイクル時は実効刻み _sub·dt で後退させる
+        dt_inj = self.dt * self._sub if (inj.species == "ion" and self._sub > 1) else self.dt
+        # 軸対称も E だけで後退させる (回転法なので遠心力の項は入らない。初期の後退キックと同じ)
+        v[:, :2] -= 0.5 * dt_inj * (sp.q / sp.m) * e_at
+        n = len(elem)
+        sp.x = np.concatenate([sp.x, self._inj_pos])
+        sp.v = np.concatenate([sp.v, v])
+        sp.w = np.concatenate([sp.w, np.full(n, self._inj_w)])
+        sp.elem = np.concatenate([sp.elem, elem])
+        self._bary_append(sp, self._inj_bary)
+        if inj.species == "ion":
+            self._f_ion_cache = None  # イオンが増えたので堆積キャッシュを無効化
+
+    def _emit_fn(self, exy: np.ndarray) -> float:
+        """FN 電界放出 (prompts/46)。現ステップの表面電界から電子を放出する。
+
+        各セグメントの放出実電子数 I·dt/e をマクロ重み w で割り、床関数の余りを
+        セグメントごとに持ち越す (時間平均で正確に I を再現する)。放出位置は
+        セグメント上の一様乱数、初速は法線方向 init_energy_ev。注入と同様に
+        初期半ステップ後退キックを適用する。
+
+        放出マクロ数が FN_MAX_MACROS_PER_STEP を超える場合 (強電界 + 小さい
+        macro_weight で I·dt/(e·w) が巨大になるケース、prompts/53) は、マクロ数を
+        上限に抑えて実効重み w_eff = total·w/上限 を与える (総電荷は保存される。
+        メモリ確保エラー対策)。
+
+        戻り値: このステップの総放出電流 [A/m]。
+        """
+        surf = self._fn_surf
+        fn = self.pic.fn
+        # 座標系を渡す (rz では I [A] = J·L·2πr̄。放出実電子数 I·dt/e は自動整合)
+        _f_surf, seg_i = fn_segment_currents(surf, exy, fn, self.project.coord)
+        i_tot = float(seg_i.sum())
+        quota = seg_i * (self.dt / (QE * self._fn_w)) + self._fn_frac
+        n_int = np.floor(quota).astype(np.int64)
+        self._fn_frac = quota - n_int
+        total = int(n_int.sum())
+        if total == 0:
+            return i_tot
+        if total > FN_MAX_MACROS_PER_STEP:
+            # マクロ数を上限に抑え、重みを引き上げて電荷を保存する (prompts/53)
+            counts = distribute_particles(n_int.astype(np.float64), FN_MAX_MACROS_PER_STEP)
+            w_emit = self._fn_w * (total / FN_MAX_MACROS_PER_STEP)
+            n_emit = int(counts.sum())  # == FN_MAX_MACROS_PER_STEP
+            seg_idx = np.repeat(np.arange(len(seg_i)), counts)
+        else:
+            w_emit = self._fn_w
+            n_emit = total
+            seg_idx = np.repeat(np.arange(len(seg_i)), n_int)
+        t = self._fn_rng.random(n_emit)
+        pos = (
+            surf.pa[seg_idx]
+            + t[:, None] * (surf.pb[seg_idx] - surf.pa[seg_idx])
+            + surf.delta[seg_idx, None] * surf.nrm[seg_idx]
+        )
+        elem = surf.elem[seg_idx]
+        sp = self.species["electron"]
+        v = np.zeros((n_emit, 3))
+        v[:, :2] = self._fn_speed * surf.nrm[seg_idx]
+        # 初期半ステップ後退キック (注入と同じ規約)
+        e_at = exy[elem]
+        v[:, :2] -= 0.5 * self.dt * (sp.q / sp.m) * e_at
+        bary = self._bary_of(pos, elem)
+        sp.x = np.concatenate([sp.x, pos])
+        sp.v = np.concatenate([sp.v, v])
+        sp.w = np.concatenate([sp.w, np.full(n_emit, w_emit)])
+        sp.elem = np.concatenate([sp.elem, elem])
+        self._bary_append(sp, bary)
+        self.fn_events += n_emit
+        if self.circuit is not None:
+            # 電極から出た電子の分 +e·w を、出た点 (セグメント上の位置 t) の重みで電極へ (prompts/134)
+            self._cap_add(surf.n1[seg_idx], surf.n2[seg_idx], 1.0 - t, np.full(n_emit, QE * w_emit))
+        return i_tot
+
+    # ---- 粒子マージ (高速化③、prompts/77) -------------------------------------
+
+    def _merge_species(self, sp: PicSpecies, n_max: int) -> int:
+        """1種にセル内保存的マージ (Vranic et al. 2015 の k→2 マージ) を適用する。
+
+        種のマクロ粒子数が n_max を超えている場合のみ実行し、粒子数の多いセル
+        (メッシュ要素) から処理して n_max の MERGE_TARGET_FRAC (=90%) 程度まで
+        減ったら打ち切る (削りすぎ防止。届かなくても次回のトリガーでまた削る)。
+
+        セル内をさらに平均速度の符号 (最大8オクタント) で分割してから k(≥3) 個を
+        2個へ置き換えるのは、セル内の全粒子を一括で1グループにすると分布関数
+        (IEDF/IADF 等) が大きく歪むため。同方向・同程度の速度の粒子同士だけを
+        混ぜることで歪みをオクタント内のばらつき程度に抑える。
+
+        置換後の2粒子は重み W/2、速度 v± = P/W ± Δ·(等方ランダム単位ベクトル)
+        (|Δ|² = E/W − |P/W|²、Cauchy-Schwarz より非負のはずだが数値誤差で
+        僅かに負になり得るため 0 に clip)、位置は重み付き平均 x̄ = Σw·x/W
+        (同一セル内かつ P1 形状関数が affine なので、電荷堆積 Σw·L_i(x) は
+        マージ前後で厳密に不変 — L_i(x̄)·W = Σw·L_i(x) が affine 性から成り立つ)。
+
+        戻り値: 削減したマクロ粒子数 (削減が無ければ 0)。
+        """
+        n0 = len(sp.x)
+        if n0 <= n_max:
+            return 0
+        target = int(n_max * MERGE_TARGET_FRAC)
+
+        # 要素番号でソートしてセルごとにグループ化する (O(N log N))
+        order = np.argsort(sp.elem, kind="stable")
+        elem_sorted = sp.elem[order]
+        _cell_elem, cell_start, cell_count = np.unique(
+            elem_sorted, return_index=True, return_counts=True
+        )
+        # 粒子数の多いセルから処理する (少ないセルを処理しても削減効率が悪いため)
+        cell_order = np.argsort(-cell_count)
+
+        remove = np.zeros(n0, dtype=bool)
+        new_x: list[np.ndarray] = []
+        new_v: list[np.ndarray] = []
+        new_w: list[float] = []
+        new_elem: list[int] = []
+        n_cur = n0
+
+        for ci in cell_order:
+            if n_cur <= target:
+                break
+            cnt = int(cell_count[ci])
+            if cnt < MERGE_MIN_GROUP:
+                break  # cell_count は降順ソート済みなので、以降のセルも全て閾値未満
+            idx = order[cell_start[ci]: cell_start[ci] + cnt]  # 元インデックス (このセルの粒子)
+
+            # セル内平均速度 (単純平均。オクタント分割の基準に使うだけなので重み無しで十分)
+            v_cell = sp.v[idx]
+            v_mean = v_cell.mean(axis=0)
+            sign = v_cell >= v_mean
+            oct_key = (
+                sign[:, 0].astype(np.int64)
+                | (sign[:, 1].astype(np.int64) << 1)
+                | (sign[:, 2].astype(np.int64) << 2)
+            )
+            for k in range(8):
+                grp = idx[oct_key == k]
+                m = grp.size
+                if m < MERGE_MIN_GROUP:
+                    continue
+                w = sp.w[grp]
+                w_sum = float(w.sum())
+                if w_sum <= 0.0:
+                    continue
+                v_grp = sp.v[grp]
+                x_grp = sp.x[grp]
+                p_vec = (w[:, None] * v_grp).sum(axis=0)          # Σ w·v (3成分)
+                e_tot = float((w * np.sum(v_grp * v_grp, axis=1)).sum())  # Σ w·|v|²
+                v_bar = p_vec / w_sum
+                x_bar = (w[:, None] * x_grp).sum(axis=0) / w_sum
+                delta2 = max(e_tot / w_sum - float(v_bar @ v_bar), 0.0)
+                delta = math.sqrt(delta2)
+                d = self._merge_rng.normal(size=3)
+                d_norm = float(np.linalg.norm(d))
+                d = d / d_norm if d_norm > 1e-300 else np.array([1.0, 0.0, 0.0])
+                new_x.append(x_bar)
+                new_x.append(x_bar)
+                new_v.append(v_bar + delta * d)
+                new_v.append(v_bar - delta * d)
+                new_w.append(w_sum * 0.5)
+                new_w.append(w_sum * 0.5)
+                new_elem.append(sp.elem[grp[0]])
+                new_elem.append(sp.elem[grp[0]])
+                remove[grp] = True
+                n_cur -= m - 2
+                self.merge_events += 1
+
+        if not new_x:
+            return 0
+
+        keep = ~remove
+        sp.x = np.concatenate([sp.x[keep], np.asarray(new_x)])
+        sp.v = np.concatenate([sp.v[keep], np.asarray(new_v)])
+        sp.w = np.concatenate([sp.w[keep], np.asarray(new_w)])
+        sp.elem = np.concatenate([sp.elem[keep], np.asarray(new_elem, dtype=sp.elem.dtype)])
+        sp.bary = None  # 位置が変わったので重心座標キャッシュは無効化 (遅延再計算)
+        sp.nidx = None
+        removed = n0 - len(sp.x)
+        self.merge_removed += removed
+        return removed
+
+    def _merge_step(self) -> None:
+        """マージのトリガー判定と実行 (種ごと、prompts/77)。
+
+        呼び出し元 (step()) が pic.merge is not None のときだけ呼ぶため、
+        ここでは every の判定のみ行う。
+        """
+        merge = self.pic.merge
+        if self.step_count % merge.every != 0:
+            return
+        for sp in self.species.values():
+            removed = self._merge_species(sp, merge.n_max)
+            if removed <= 0:
+                continue
+            # 不動種・サブサイクル中のイオンは電荷堆積ベクトルをキャッシュしているため、
+            # 粒子配列が変わったら他の粒子追加・除去箇所と同じ規約で無効化する
+            if not sp.mobile:
+                self._f_immobile.pop(sp.name, None)
+            if sp.name == "ion":
+                self._f_ion_cache = None
+
+    def _sort_particles_by_cell(self) -> None:
+        """種ごとの粒子配列を所属要素 (elem) 順に並べ替える (高速化③、prompts/84)。
+
+        隣り合うインデックスの粒子が同じ・近いセルを触るようにすることで、
+        gather (E補間)・deposit (電荷堆積)・walk (隣接セル参照) のメモリアクセスの
+        空間局所性を上げる。粒子は生成順 (装荷・注入・電離順) のまま蓄積されるため、
+        ステップを重ねるほど所属セルの並びはバラバラになる。
+
+        stable ソートを使う理由: 同一セル内の相対順序を保つことで、粒子順に乱数を
+        消費する処理 (MCC 等) への影響を「異なるセル間の順序変化」のみに抑える
+        (同一セル内の粒子同士の相対順は不変)。ただし他セルとの相対順は変わるため、
+        ソートあり/なしの実行はステップを跨ぐとビット単位では一致しなくなる
+        (統計的には同等。同一シードでの再実行同士は決定的に一致し続ける)。
+
+        不動種 (immobile、mobile=False) は動かないため元の並びが局所性を失わず、
+        並べ替える意味が無いのでスキップする。
+
+        バッファ再利用との整合: 並べ替えはファンシーインデックス (常に新規配列)
+        で行うため、push+walk 出力バッファ (_push_walk_buffers) が現在状態と
+        共有していたメモリは自動的に「共有していない予備」として扱われる
+        (_push_walk_output_buffers / _release_push_walk_spares の np.shares_memory
+        判定がそのまま機能する)。専用の無効化処理は不要。
+        """
+        for sp in self.species.values():
+            if not sp.mobile or len(sp.elem) == 0:
+                continue
+            # 粒子数 ≫ 要素数が通常のケースなので、比較ソートではなく
+            # 計数ソート (numba あれば O(N + 要素数)) で置換インデックスを求める
+            # (_numba_kernels.cell_sort_order を参照。argsort と同じ安定な結果)
+            order = _numba_kernels.cell_sort_order(sp.elem, len(self.tris))
+            sp.x = sp.x[order]
+            sp.v = sp.v[order]
+            sp.w = sp.w[order]
+            sp.elem = sp.elem[order]
+            # 重心座標キャッシュは同じ置換で追従させれば再計算を避けられる
+            # (無効なキャッシュ = None ならそのまま、次回参照時に自然に再計算される)
+            if sp.bary is not None and len(sp.bary) == len(order):
+                sp.bary = sp.bary[order]
+            sp.nidx = None  # tris_dep[elem] は安価に再計算できるため単純に無効化
+            if sp.name == "ion":
+                # イオンサブサイクル中の堆積キャッシュ (prompts/50) は、粒子の並びが
+                # 変わっても合計値としては不変 (Σ は順序に依存しない量) だが、他の
+                # 粒子配列変更箇所と同じ規約で揃えて無効化する (安全側・意図を明確にする)
+                self._f_ion_cache = None
+
+    def _walk_chunked_submit(
+        self, elem: np.ndarray, x_new: np.ndarray, l_new: np.ndarray, futures: list
+    ):
+        """1種の walk を粒子チャンクに分割してプールへ投入する (prompts/50)。
+
+        各粒子の walk は完全に独立 (読み取り共有のみ・書き込みは自分の行のみ) の
+        決定的処理なので、チャンク分割しても結果は逐次実行とビット単位で一致する。
+        戻り値は出力先の (elem_new, absorbed, b_elem, b_loc)。呼び出し側が
+        futures の完了を待ってから読むこと。粒子数が少ない種はスレッド起動コストの
+        方が高いため、その場で逐次計算する (futures には積まない)。
+        """
+        n = len(elem)
+        if n < 4096:
+            return _walk_step(
+                self.coeffs, self.adjacency, elem, x_new, l_new,
+                packed=self._coeffs_packed,
+            )
+        k = self._nthreads
+        bounds = [(i * n) // k for i in range(k + 1)]
+        elem_new = np.empty(n, dtype=np.int64)
+        absorbed = np.empty(n, dtype=bool)
+        b_elem = np.empty(n, dtype=np.int64)
+        b_loc = np.empty(n, dtype=np.int64)
+
+        def _run(lo: int, hi: int) -> None:
+            sub_l = None if l_new is None else l_new[lo:hi]
+            e, a, be, bl = _walk_step(
+                self.coeffs, self.adjacency, elem[lo:hi], x_new[lo:hi], sub_l,
+                packed=self._coeffs_packed,
+            )
+            elem_new[lo:hi] = e
+            absorbed[lo:hi] = a
+            b_elem[lo:hi] = be
+            b_loc[lo:hi] = bl
+
+        for i in range(k):
+            if bounds[i + 1] > bounds[i]:
+                futures.append(self._chunk_pool.submit(_run, bounds[i], bounds[i + 1]))
+        return elem_new, absorbed, b_elem, b_loc
+
+    def _run_walks(self, pushed) -> list:
+        """種ごとの walk を実行する (2種以上なら並列)。
+
+        walk は乱数を使わず入力のみで決まる決定的処理で、種間で共有する
+        書き込み先も無いため、並列化しても結果はビット単位で不変。
+        threads > 1 (prompts/50) では全種のチャンクをまとめてプールへ投入し、
+        全ワーカーで消化する (種横断で負荷分散する)。
+
+        numba あり (prompts/76) では、walk カーネル自体が njit(parallel=True)
+        の prange で全コアを使うため、ここでの ThreadPoolExecutor チャンク分割は
+        二重の並列化になるだけで意味が無い (むしろスレッド起動オーバーヘッドが
+        増える)。そのため numba 版では種ごとに1回ずつ素直に呼び出す
+        (_walk_step 内部で numba カーネルへ委譲される)。
+        """
+        if _numba_kernels.HAVE_NUMBA:
+            return [
+                _walk_step(
+                    self.coeffs, self.adjacency, sp.elem, x_new, l_new,
+                    packed=self._coeffs_packed,
+                )
+                for sp, _v, x_new, l_new in pushed
+            ]
+        if self._chunk_pool is not None:
+            futures: list = []
+            results = [
+                self._walk_chunked_submit(sp.elem, x_new, l_new, futures)
+                for sp, _v, x_new, l_new in pushed
+            ]
+            for fut in futures:
+                fut.result()
+            return results
+        if len(pushed) <= 1:
+            return [
+                _walk_step(
+                    self.coeffs, self.adjacency, sp.elem, x_new, l_new,
+                    packed=self._coeffs_packed,
+                )
+                for sp, _v, x_new, l_new in pushed
+            ]
+        # 先頭の種 (通常は電子 = 最も重い walk) をワーカーへ、残りを主スレッドで
+        futures = [
+            _walk_pool().submit(
+                _walk_step, self.coeffs, self.adjacency, sp.elem, x_new, l_new,
+                self._coeffs_packed,
+            )
+            for sp, _v, x_new, l_new in pushed[:1]
+        ]
+        rest = [
+            _walk_step(
+                self.coeffs, self.adjacency, sp.elem, x_new, l_new,
+                packed=self._coeffs_packed,
+            )
+            for sp, _v, x_new, l_new in pushed[1:]
+        ]
+        return [f.result() for f in futures] + rest
+
+    def _push_walk_output_buffers(
+        self, sp: PicSpecies, n: int
+    ) -> tuple[np.ndarray, ...]:
+        """現在の粒子状態と別領域の再利用可能なpush+walk出力を返す。
+
+        境界衝突補間やSEEはカーネル実行後も更新前のsp.x/sp.vを参照するため、
+        入出力を同じ配列にはしない。通常は2組のバッファを交互利用する。
+        """
+
+        def aliases_state(buf: tuple[np.ndarray, ...]) -> bool:
+            return (
+                np.shares_memory(buf[0], sp.v)
+                or np.shares_memory(buf[1], sp.x)
+                or np.shares_memory(buf[2], sp.w)
+                or np.shares_memory(buf[3], sp.elem)
+                or (sp.bary is not None and np.shares_memory(buf[7], sp.bary))
+            )
+
+        def allocate(capacity: int) -> tuple[np.ndarray, ...]:
+            return (
+                np.empty((capacity, 3), dtype=np.float64),
+                np.empty((capacity, 2), dtype=np.float64),
+                np.empty(capacity, dtype=np.float64),
+                np.empty(capacity, dtype=np.int64),
+                np.empty(capacity, dtype=np.bool_),
+                np.empty(capacity, dtype=np.int64),
+                np.empty(capacity, dtype=np.int64),
+                np.empty((capacity, 3), dtype=np.float64),
+            )
+
+        pool = self._push_walk_buffers.setdefault(sp.name, [])
+        for i, buf in enumerate(pool):
+            if aliases_state(buf):
+                continue
+            if len(buf[2]) >= n:
+                return buf
+            capacity = max(n, len(buf[2]) + max(256, len(buf[2]) // 2))
+            pool[i] = allocate(capacity)
+            return pool[i]
+
+        # 初期化直後または、唯一の既存バッファが現在状態になっている場合。
+        capacity = max(1024, n + max(256, n // 8))
+        buf = allocate(capacity)
+        pool.append(buf)
+        return buf
+
+    def _release_push_walk_spares(self) -> None:
+        """run_batch完了後、現在状態ではない予備バッファの参照を解放する。"""
+        for name, pool in self._push_walk_buffers.items():
+            sp = self.species.get(name)
+            if sp is None:
+                pool.clear()
+                continue
+            pool[:] = [
+                buf
+                for buf in pool
+                if (
+                    np.shares_memory(buf[0], sp.v)
+                    or np.shares_memory(buf[1], sp.x)
+                    or np.shares_memory(buf[2], sp.w)
+                    or np.shares_memory(buf[3], sp.elem)
+                    or (
+                        sp.bary is not None
+                        and np.shares_memory(buf[7], sp.bary)
+                    )
+                )
+            ]
+
+    # ---- 1ステップ -----------------------------------------------------------
+
+    def step(self) -> np.ndarray:
+        """PIC 1サイクル。時刻 t_n の場を解き、粒子を t_{n+1} へ進める。
+
+        戻り値: 時刻 t_n の節点電位 φ (フレーム生成に使う)。
+        """
+        dt = self.dt
+        t = self.t
+        # このステップが時間平均区間に入るか (step_count はステップ末尾で +1 される)
+        accumulating = (
+            self._accum_start is not None
+            and self.step_count + 1 >= self._accum_start
+        )
+        if accumulating:
+            # 位相分解配列は大きくなり得るため、平均区間に入るまで確保しない。
+            # MCC 電離イベントがフィールド積算より先に書き込むので、ステップ先頭で
+            # 必ず準備する。
+            self._ensure_accumulators()
+
+        # 1. 電荷堆積 → 2. ポアソン求解 (RF 含む V(t) で Dirichlet 更新)
+        # 位相別計測 (prompts/75): 堆積とポアソン求解を別フェーズとして計測する
+        t_dep0 = time.perf_counter()
+        f_dep = self._deposit()
+        t_dep1 = time.perf_counter()
+        self.timing["deposit"] += t_dep1 - t_dep0
+        phi = self._solve_phi(f_dep, t)
+        t_solve1 = time.perf_counter()
+        self.timing["solve"] += t_solve1 - t_dep1
+        # 3. E 補間の準備 (要素ごとの一定値)
+        ex, ey = self._e_field(phi)
+        # 場のエネルギー (xy: [J/m]、rz: [J]。elem_vol は xy では area と同一)
+        fe = float(np.sum(0.5 * self.eps_elem * (ex**2 + ey**2) * self.elem_vol))
+        # 要素ごとの E を (M,2) に詰め、粒子への補間 gather を1回で済ませる
+        exy = np.stack([ex, ey], axis=1)
+
+        # 4. リープフロッグでプッシュ (種ごとの v_new, x_new を先に全て計算する)
+        # イオンサブサイクリング (prompts/50): イオンは _sub ステップに1回だけ
+        # 実効刻み _sub·dt で押す (最初のプッシュは step_count = 0)
+        push_ions = self._sub == 1 or (self.step_count % self._sub == 0)
+        ke: dict[str, float] = {}
+        pushed: list[tuple[PicSpecies, np.ndarray, np.ndarray, np.ndarray]] = []
+        # 融合経路のvdotはKE評価後に不要になるため、境界吸収時の重み圧縮先として
+        # 再利用する。NumPyフォールバックではNoneとして従来の抽出処理を保つ。
+        compact_weight_buffers: list[np.ndarray | None] = []
+        # 基本xy・軸対称・一様磁場経路はpushとwalkを同じ粒子ループへ融合し、
+        # 中間配列の再読込とNumbaディスパッチを減らす。
+        fuse_push_walk = _numba_kernels.HAVE_NUMBA
+        fused_walk_results: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for sp in self.species.values():
+            if len(sp.x) == 0:
+                ke[sp.name] = 0.0
+                continue
+            if not sp.mobile:
+                # 不動種: 運動エネルギーのみ評価
+                ke[sp.name] = 0.5 * sp.m * float(np.sum(sp.w * np.sum(sp.v**2, axis=1)))
+                continue
+            if sp.name == "ion" and not push_ions:
+                # サブサイクル休止ステップ: イオンは動かさず、KE は直近プッシュ時の
+                # 値を流用する (位置・所属要素・堆積キャッシュはそのまま有効)
+                ke[sp.name] = self._last_ke_i
+                continue
+            dt_sp = dt * self._sub if (sp.name == "ion" and self._sub > 1) else dt
+            if fuse_push_walk:
+                # gather・push・walkを1つのnjitループに融合する。軸対称では
+                # 回転法の移動と回転も含め、各粒子内の演算順をnumpy経路と揃える。
+                if self.rz:
+                    fused_kernel = _numba_kernels.gather_push_walk_rz
+                    fused_args = (self.ridx,)
+                elif self._b is not None:
+                    fused_kernel = _numba_kernels.gather_push_walk_boris
+                    fused_args = (self._boris_rt[sp.name],)
+                else:
+                    fused_kernel = _numba_kernels.gather_push_walk
+                    fused_args = ()
+                (
+                    v_new,
+                    x_new,
+                    vdot,
+                    elem_new,
+                    absorbed,
+                    b_elem,
+                    b_loc,
+                    l_new,
+                ) = fused_kernel(
+                    exy,
+                    self._coeffs_packed,
+                    self.adjacency,
+                    sp.elem,
+                    sp.q,
+                    sp.m,
+                    dt_sp,
+                    *fused_args,
+                    sp.x,
+                    sp.v,
+                    out=self._push_walk_output_buffers(sp, len(sp.x)),
+                )
+                ke[sp.name] = 0.5 * sp.m * float(np.sum(sp.w * vdot))
+                if sp.name == "ion":
+                    self._last_ke_i = ke[sp.name]
+                pushed.append((sp, v_new, x_new, l_new))
+                compact_weight_buffers.append(vdot)
+                fused_walk_results.append((elem_new, absorbed, b_elem, b_loc))
+                continue
+            e_at = exy[sp.elem]
+            v_new = sp.v.copy()
+            if self.rz:
+                # 軸対称プッシュ (回転法、v2 の kernels/pic.cu の push と同じ): 速度は粒子の位置の
+                # 局所直交座標 (軸・径・周) の成分で、v[:, 2] は vθ。ここでは E だけで蹴り、移動の後に
+                # 子午面へ回転する (下)。遠心力の項 vθ²/r は使わない (軸の近くで L²/r³ が発散するため)
+                v_new[:, :2] += dt_sp * ((sp.q / sp.m) * e_at)
+            elif self._b is not None:
+                # 一様磁場 (prompts/51):
+                # Boris 法 (半キック E → 回転 B → 半キック E)
+                half = (sp.q / sp.m) * (0.5 * dt_sp)
+                v_new[:, :2] += half * e_at
+                v_new = v_new @ self._boris_rt[sp.name]
+                v_new[:, :2] += half * e_at
+            else:
+                # 2d3v: E は vx, vy のみに作用し、vz はそのまま
+                v_new[:, :2] += (sp.q / sp.m) * dt_sp * e_at
+            # 時刻中心化した運動エネルギー:
+            # KE(t_n) ≈ ½ m Σ w v(n-1/2)·v(n+1/2)
+            vdot = (
+                sp.v[:, 0] * v_new[:, 0] + sp.v[:, 1] * v_new[:, 1]
+            ) + sp.v[:, 2] * v_new[:, 2]
+            x_new = sp.x + dt_sp * v_new[:, :2]
+            # vdotの総和は従来どおりnumpyに任せ、決定的な加算順を維持する。
+            ke[sp.name] = 0.5 * sp.m * float(np.sum(sp.w * vdot))
+            if sp.name == "ion":
+                self._last_ke_i = ke[sp.name]
+            if self.rz:
+                # 回転法: 局所座標で 3D の直線移動 (径 r + vr·dt、周 vθ·dt) をして新しい半径へ移し、
+                # (vr, vθ) を同じ角だけ回して新しい位置の局所座標に直す。角運動量 r·vθ と |v| は厳密に
+                # 保存し、子午面の変位は |v|·dt を超えない。軸を越える移動 (r + vr·dt < 0) も r ≥ 0 の
+                # まま扱え (軸 r=0 は境界メッシュエッジだが吸収させない)、vθ = 0 では従来の軸の鏡映
+                # (r → −r、vr → −vr) と一致する。融合カーネル (_numba_kernels) と演算順をそろえる
+                ridx = self.ridx
+                xr = x_new[:, ridx]
+                yt = dt_sp * v_new[:, 2]
+                r_new = np.sqrt(xr * xr + yt * yt)
+                moved = r_new > 0.0
+                r_div = np.where(moved, r_new, 1.0)
+                cos_a = np.where(moved, xr / r_div, 1.0)
+                sin_a = np.where(moved, yt / r_div, 0.0)
+                vr = v_new[:, ridx]
+                vt = v_new[:, 2]
+                vr_rot = cos_a * vr + sin_a * vt
+                vt_rot = -sin_a * vr + cos_a * vt
+                v_new[:, ridx] = vr_rot
+                v_new[:, 2] = vt_rot
+                x_new[:, ridx] = r_new
+            pushed.append((sp, v_new, x_new, np.empty((len(x_new), 3))))
+            compact_weight_buffers.append(None)
+        t_push1 = time.perf_counter()
+        # 融合経路ではカーネル内walkもここへ含まれる。分離計測のために再走査すると
+        # 高速化効果を失うため、gather_pushを「融合カーネル時間」として扱う。
+        self.timing["gather_push"] += t_push1 - t_solve1
+
+        # 5. walk 更新。融合経路では結果を既に得ているため、ここは境界処理だけになる。
+        # 分離経路は種ごとに独立・決定的なので、2種のときは並列に実行する。
+        # 位相別計測 (prompts/75): スレッド並列時も submit〜完了待ちの壁時計時間を
+        # そのまま計測する (_run_walks 内部で完了待ちまで行うため)
+        walk_results = fused_walk_results if fuse_push_walk else self._run_walks(pushed)
+        t_walk1 = time.perf_counter()
+        self.timing["walk"] += t_walk1 - t_push1
+
+        # 5.1. 境界吸収・鏡面反射・SEE (種の順序は従来どおり electron → ion)
+        for (sp, v_new, x_new, l_new), res_walk, weight_out in zip(
+            pushed, walk_results, compact_weight_buffers
+        ):
+            elem_new, absorbed, b_elem, b_loc = res_walk
+            # 鏡面反射エッジに達した粒子は吸収せず折り返し、周期エッジに達した
+            # 粒子は反対側へラップする (いずれも壁カウンタに含めない)
+            if (
+                self._edge_reflect is not None or self._edge_periodic is not None
+            ) and np.any(absorbed):
+                for _ in range(8):
+                    if self._edge_reflect is not None and np.any(absorbed):
+                        self._apply_reflection(
+                            x_new, v_new, elem_new, absorbed, b_elem, b_loc, l_new
+                        )
+                    if self._edge_periodic is None or not self._apply_periodic(
+                        x_new, elem_new, absorbed, b_elem, b_loc, l_new
+                    ):
+                        break
+            # 誘電体 (固体) 要素へ入った粒子は表面で吸収する
+            # (壁カウンタに計上するが SEE は発生させない、prompts/24)。
+            # 吸収電荷は表面電荷 Q_surf へ蓄積して場にフィードバックする (prompts/25)
+            if self._solid_elem is not None:
+                solid_hit = ~absorbed & self._solid_elem[elem_new]
+                if np.any(solid_hit):
+                    self._accumulate_surface_charge(sp, elem_new, l_new, solid_hit)
+                    # 誘電体 SEE (prompts/38): γ>0 の誘電体へのイオン吸収のみ
+                    # (電子の誘電体吸収では発生させない)
+                    if sp.name == "ion" and self._solid_gamma is not None:
+                        self._emit_see_dielectric(sp, v_new, elem_new, l_new, solid_hit)
+                removed = absorbed | solid_hit
+            else:
+                removed = absorbed
+            n_abs = int(removed.sum())
+            if n_abs:
+                sp.wall_absorbed += n_abs
+                if self.circuit is not None and np.any(absorbed):
+                    # 境界エッジで吸収した粒子の電荷を、当たった点の P1 重みで電極へ (prompts/134。
+                    # sp.x は更新前の位置。誘電体へ吸収した分は表面電荷なので数えない)
+                    a_idx = np.nonzero(absorbed)[0]
+                    ea, eloc = b_elem[a_idx], b_loc[a_idx]
+                    hit = self._edge_hit(ea, eloc, sp.x[a_idx], x_new[a_idx])
+                    self._cap_add(*self._cap_edge_weight(ea, eloc, hit), sp.q * sp.w[a_idx])
+                # IEDF/IADF コレクタ: 平均区間中に吸収されたイオンを記録
+                # (外周・電極輪郭・誘電体表面のすべて。電子・SEE は対象外)
+                if sp.name == "ion" and self._collectors_st and accumulating:
+                    self._collect_ions(
+                        sp, x_new, v_new, absorbed, b_elem, b_loc, removed
+                    )
+                # SEE: γ>0 電極へのイオン吸収で二次電子を生成 (sp.x は更新前の位置)
+                if sp.name == "ion" and self._edge_gamma is not None and np.any(absorbed):
+                    self._emit_see(sp, x_new, b_elem, b_loc, absorbed)
+                if weight_out is not None:
+                    # push+walk出力を安定順序でin-place圧縮し、KE計算済みの
+                    # vdotバッファを重み出力へ転用して5つの再確保を避ける。
+                    n_keep = _numba_kernels.compact_particle_state(
+                        x_new,
+                        v_new,
+                        sp.w,
+                        elem_new,
+                        l_new,
+                        removed,
+                        weight_out,
+                    )
+                    sp.x = x_new[:n_keep]
+                    sp.v = v_new[:n_keep]
+                    sp.w = weight_out[:n_keep]
+                    sp.elem = elem_new[:n_keep]
+                    sp.bary = l_new[:n_keep]
+                else:
+                    keep = ~removed
+                    sp.x = x_new[keep]
+                    sp.v = v_new[keep]
+                    sp.w = sp.w[keep]
+                    sp.elem = elem_new[keep]
+                    sp.bary = l_new[keep]
+            else:
+                sp.x = x_new
+                sp.v = v_new
+                sp.elem = elem_new
+                sp.bary = l_new
+            sp.nidx = None  # 所属要素が変わったので節点番号キャッシュを無効化
+            if sp.name == "ion":
+                self._f_ion_cache = None  # イオンが動いたので堆積キャッシュを無効化
+        # 境界吸収・反射・周期・SEE も「5. walk 更新・境界吸収」の一部として計測する
+        t_walk2 = time.perf_counter()
+        self.timing["walk"] += t_walk2 - t_walk1
+
+        # 5.5. MCC 衝突 (衝突は位置を変えないので所属要素の更新は不要)
+        if self.mcc is not None:
+            el = self.species["electron"]
+            io = self.species["ion"]
+            if len(el.x):
+                res = self.mcc.collide_electrons(el.x, el.v, el.w, el.elem, dt)
+                self.coll_e += res.n_coll
+                self.ion_events += res.n_ionization
+                if res.new_x is not None:
+                    # 電離: 衝突位置に新電子 + 新イオン (ガス温度 Maxwell) を生成
+                    new_l = self._bary_of(res.new_x, res.new_elem)  # 電子・イオン共通
+                    if accumulating:
+                        # 電離イベント発生位置を P1 重みで散布 (電離レート用)
+                        ion_vec = np.bincount(
+                            self.tris_dep[res.new_elem].ravel(),
+                            weights=(res.new_w[:, None] * new_l).ravel(),
+                            minlength=self.n_nodes,
+                        )
+                        self._accum_ion += ion_vec
+                        if self._cycle_ion is not None:
+                            # 位相分解の電離レート (prompts/52)。t はステップ開始時刻
+                            self._cycle_ion[self._phase_bin(t)] += ion_vec
+                    self._append_species_buffered(
+                        el,
+                        res.new_x,
+                        res.new_v_e,
+                        res.new_w,
+                        res.new_elem,
+                        new_l,
+                    )
+                    self._append_species_buffered(
+                        io,
+                        res.new_x,
+                        res.new_v_i,
+                        res.new_w,
+                        res.new_elem,
+                        new_l,
+                    )
+                    # 不動イオン・サブサイクル中のイオンの堆積キャッシュを無効化
+                    self._f_immobile.pop("ion", None)
+                    self._f_ion_cache = None
+            if io.mobile and len(io.x) and push_ions:
+                # サブサイクル時 (prompts/50) はイオン衝突もプッシュステップに
+                # 実効刻み _sub·dt でまとめて適用する (衝突は速度のみ変えるため
+                # 堆積キャッシュには影響しない)。elem は非一様ガス場の局所参照用
+                self.mcc.collide_ions(
+                    io.v, dt * self._sub if self._sub > 1 else dt, io.elem
+                )
+        # MCC 無効時も t_walk2 との差分は測るので常に加算する (self.mcc is None なら ≈0)
+        t_mcc1 = time.perf_counter()
+        self.timing["mcc"] += t_mcc1 - t_walk2
+
+        # 6. 注入
+        if self.pic.injection is not None:
+            self._inject(ex, ey)
+        # 6.5. FN 電界放出 (prompts/46)。表面電界はこのステップの場 (exy) を使う
+        fn_i = self._emit_fn(exy) if self._fn_surf is not None else 0.0
+        # 6.6. 阻止コンデンサの電極の電荷 Q_N に、このステップの伝導電流を積む (prompts/134)
+        if self.circuit is not None:
+            self.circuit.conduct(self._cap_dq / dt, t, dt)
+            self._cap_dq = np.zeros(self.circuit.m)
+
+        self.t = t + dt
+        self.step_count += 1
+
+        # 7. 粒子マージ (高速化③、既定OFF、prompts/77)。every ステップごとに種の
+        # マクロ粒子数をチェックし、n_max を超えていればセル内保存的マージで削減する。
+        # merge=None ならこの呼び出し自体が無く、rng も一切引かない
+        # (= 従来の実行経路とビット単位で完全一致する)。
+        # 節点密度・時間平均フィールドの積算より前に行い、平均が反映する粒子状態を
+        # 揃える (電荷堆積は P1 形状関数が affine なのでマージ前後で厳密に不変)
+        if self.pic.merge is not None:
+            self._merge_step()
+        # 7'. 半径に比例した重み (軸対称、prompts/136): 重すぎる粒子の分割と軽すぎる粒子の対の併合。
+        # どちらも電荷堆積を変えない (分割は同じ位置、併合は同じ要素の重み付き平均の位置で P1 が affine)
+        if self._rw:
+            self._pop_control(push_ions)
+
+        # 節点密度・時間平均フィールド (enable_density_accum 以後、毎ステップ積算)
+        if accumulating:
+            self._accumulate_fields(phi, ex, ey, t)
+            # EEDF/EEPF 領域 (prompts/85)。領域未設定なら _eedf_st が空でゼロコスト
+            self._accumulate_eedf()
+
+        # 診断記録 (毎ステップ)
+        el, io = self.species["electron"], self.species["ion"]
+        h = self.history
+        h["t"].append(t)
+        h["ke_e"].append(ke["electron"])
+        h["ke_i"].append(ke["ion"])
+        h["fe"].append(fe)
+        h["n_e"].append(len(el.x))
+        h["n_i"].append(len(io.x))
+        h["wall_e"].append(el.wall_absorbed)
+        h["wall_i"].append(io.wall_absorbed)
+        h["phi_min"].append(float(phi.min()))
+        h["phi_max"].append(float(phi.max()))
+        h["coll_e"].append(self.coll_e)
+        h["ion_events"].append(self.ion_events)
+        h["see_events"].append(self.see_events)
+        # 累計表面電荷 (全誘電体合計 [C/m])。誘電体なしなら常に 0
+        h["surf_q"].append(float(self.q_surf.sum()))
+        # 粒子マージ (prompts/77) で削減した累計マクロ粒子数。無効なら常に 0
+        h["merged"].append(self.merge_removed)
+        # 半径に比例した重み (prompts/136) の分割で増やした累計マクロ粒子数。使わなければ常に 0
+        h["split"].append(self.split_added)
+        # FN 電界放出: このステップの総放出電流 [A/m] と累計放出マクロ電子数
+        h["fn_i"].append(fn_i)
+        h["fn_events"].append(self.fn_events)
+
+        # 8. セル順ソート (高速化③、prompts/84)。診断記録の後 (このステップの
+        # 全処理が終わった後) に行うのが安全 — 途中の壁吸収判定・MCC・注入は
+        # いずれも sp.x/sp.elem の対応関係のみを使うため、並べ替え自体はどこで
+        # 行っても物理的な結果は変わらないが、記録済みの診断値には影響しない
+        # 末尾が最も見通しが良い。
+        # メッシュ要素数が SORT_MIN_ELEMS 未満なら丸ごとスキップする (実測に基づく
+        # ガード。定数の根拠は SORT_MIN_ELEMS のコメントを参照。粗いメッシュでは
+        # per-element データがキャッシュに収まり局所性改善が出ないため、
+        # ソートコストだけが乗って退行するのを避ける)
+        if len(self.tris) >= SORT_MIN_ELEMS and self.step_count % SORT_EVERY == 0:
+            self._sort_particles_by_cell()
+
+        # 注入・FN放出・時間平均積算・診断記録・セル順ソートなどの細かい処理をまとめて計測する
+        t_other1 = time.perf_counter()
+        self.timing["other"] += t_other1 - t_mcc1
+        return phi
+
+    # ---- 節点密度の時間平均 ---------------------------------------------------
+
+    def enable_density_accum(self, start_step: int) -> None:
+        """節点密度・時間平均フィールドの積算を有効化する。
+
+        step_count (完了ステップ数、1始まり) が start_step 以上のステップから、
+        毎ステップ種ごとに P1 重みで節点へマクロ重みを散布して積算する。
+        併せて φ・E ベクトル・電子運動エネルギー・電離イベントも積算する
+        (prompts/26。追加コストは平均区間のみに限られる)。
+        """
+        self._accum_start = int(start_step)
+        self._accum_count = 0
+        self._accum = {}
+        self._accum_phi = None
+        self._accum_e = None
+        self._accum_ke_e = None
+        self._accum_ion = None
+        self._cycle_phi = None
+        self._cycle_ne = None
+        self._cycle_ni = None
+        self._cycle_count = None
+        self._cycle_e = None
+        self._cycle_ke = None
+        self._cycle_ion = None
+
+    def _ensure_accumulators(self) -> None:
+        """平均区間に入った時点で診断用配列を一度だけ確保する。"""
+        if self._accum_phi is not None:
+            return
+        self._accum = {name: np.zeros(self.n_nodes) for name in self.species}
+        self._accum_phi = np.zeros(self.n_nodes)
+        self._accum_e = np.zeros((len(self.tris), 2))
+        self._accum_ke_e = np.zeros(self.n_nodes)
+        self._accum_ion = np.zeros(self.n_nodes)
+        # 位相分解アキュムレータ (RF あり + phase_bins > 0 のときのみ、prompts/28)
+        if self._cycle_enabled:
+            nb = self._cycle_bins
+            self._cycle_phi = np.zeros((nb, self.n_nodes))
+            self._cycle_ne = np.zeros((nb, self.n_nodes))
+            self._cycle_ni = np.zeros((nb, self.n_nodes))
+            self._cycle_count = np.zeros(nb, dtype=np.int64)
+            # 追加フィールド (prompts/52): E ベクトル・電子KE・電離イベント
+            self._cycle_e = np.zeros((nb, len(self.tris), 2))
+            self._cycle_ke = np.zeros((nb, self.n_nodes))
+            self._cycle_ion = np.zeros((nb, self.n_nodes))
+
+    def _accumulate_fields(
+        self, phi: np.ndarray, ex: np.ndarray, ey: np.ndarray, t_step: float
+    ) -> None:
+        """1ステップ分のフィールドと密度を積算する (平均区間のみ呼ばれる)。
+
+        - φ (節点)・E ベクトル (要素) はそのまま加算
+        - 電子温度用に Σ w·L_i·(½m|v|²) (3速度成分) を節点へ散布
+        - 種ごとの節点重み (Σ w_p L_i) は1回だけ散布し、全体平均 (_accum) と
+          位相ビン (RF あり) の両方で共有する。重心座標は walk のキャッシュを再利用
+        - t_step はこのステップの開始時刻 (φ の評価時刻。位相ビンの割り当てに使う)
+        """
+        self._accum_phi += phi
+        self._accum_e[:, 0] += ex
+        self._accum_e[:, 1] += ey
+
+        # RF 位相ビン (cycle 無効なら b = -1 でスキップ)
+        b = -1
+        if self._cycle_phi is not None:
+            b = self._phase_bin(t_step)
+            self._cycle_phi[b] += phi
+            self._cycle_count[b] += 1
+            # 位相分解の E ベクトル (prompts/52)
+            self._cycle_e[b, :, 0] += ex
+            self._cycle_e[b, :, 1] += ey
+
+        el = self.species["electron"]
+        if len(el.x):
+            ke_p = 0.5 * ME * (el.v[:, 0] ** 2 + el.v[:, 1] ** 2 + el.v[:, 2] ** 2)
+            contrib = (el.w * ke_p)[:, None] * self._bary_cached(el)
+            ke_vec = np.bincount(
+                self._nidx_cached(el).ravel(), weights=contrib.ravel(), minlength=self.n_nodes
+            )
+            self._accum_ke_e += ke_vec
+            if b >= 0:
+                # 位相分解の電子温度用 KE 散布 (prompts/52)
+                self._cycle_ke[b] += ke_vec
+
+        for name, sp in self.species.items():
+            if len(sp.x) == 0:
+                continue
+            contrib = sp.w[:, None] * self._bary_cached(sp)
+            vec = np.bincount(
+                self._nidx_cached(sp).ravel(), weights=contrib.ravel(), minlength=self.n_nodes
+            )
+            self._accum[name] += vec
+            if b >= 0:
+                if name == "electron":
+                    self._cycle_ne[b] += vec
+                elif name == "ion":
+                    self._cycle_ni[b] += vec
+        self._accum_count += 1
+
+    def averaged_density(self) -> dict[str, np.ndarray]:
+        """種ごとの時間平均節点密度 [m^-3] を返す。
+
+        節点集中面積 (= Σ隣接要素面積/3) で割って数密度に換算する
+        (奥行き 1 m 換算)。
+        """
+        if self._accum_start is None or self._accum_count == 0:
+            raise ValueError("enable_density_accum が呼ばれていないか、まだ積算されていません")
+        # 周期スレーブ節点は面積 0 (正準番号で積むため)。ゼロ割を避けてから
+        # マスター値をコピーする
+        na = np.where(self._node_area > 0.0, self._node_area, 1.0)
+        result = {}
+        for name, acc in self._accum.items():
+            dens = acc / (self._accum_count * na)
+            if self.canon is not None:
+                dens = dens[self.canon]
+            result[name] = dens
+        return result
+
+    def averaged_fields(self) -> dict | None:
+        """時間平均した2Dフィールド一式を返す (WS done / 検証スクリプト用、prompts/26)。
+
+        平均区間で1ステップも積算していなければ None。
+          phi:      節点、時間平均電位 [V]
+          e_abs:    要素、時間平均 |E| [V/m] (E ベクトルを平均してから絶対値)
+          n_e/n_i:  節点、時間平均密度 [m^-3]
+          te_ev:    節点、電子温度 [eV] = (2/3)×平均運動エネルギー (3速度成分)。
+                    重み和 0 (粒子なし) の節点は 0
+          ion_rate: 節点、電離レート [m^-3 s^-1]
+                    (電離イベントの P1 散布を平均時間 × 節点集中面積で規格化)
+          avg_steps: 実際に平均したステップ数
+        """
+        if self._accum_start is None or self._accum_count == 0:
+            return None
+        cnt = self._accum_count
+        dens = self.averaged_density()
+
+        phi_avg = self._accum_phi / cnt
+        e_avg = self._accum_e / cnt
+        e_abs = np.sqrt(e_avg[:, 0] ** 2 + e_avg[:, 1] ** 2)
+
+        # Te[eV] = (2/3)·(エネルギー和 / 重み和)/e。重み和 0 の節点は 0
+        w_e = self._accum["electron"]
+        te = np.zeros(self.n_nodes)
+        pos = w_e > 0.0
+        te[pos] = (2.0 / 3.0) * (self._accum_ke_e[pos] / w_e[pos]) / QE
+
+        # 電離レート = 積算重み / (平均時間 × 節点集中面積)。
+        # 周期スレーブ節点は面積 0 なのでゼロ割を避けてマスター値をコピーする
+        na = np.where(self._node_area > 0.0, self._node_area, 1.0)
+        ion_rate = self._accum_ion / (cnt * self.dt * na)
+        if self.canon is not None:
+            te = te[self.canon]
+            ion_rate = ion_rate[self.canon]
+
+        return {
+            "phi": phi_avg,
+            "e_abs": e_abs,
+            "n_e": dens["electron"],
+            "n_i": dens["ion"],
+            "te_ev": te,
+            "ion_rate": ion_rate,
+            "avg_steps": cnt,
+        }
+
+    # ---- RF 1周期の位相分解 (prompts/28) ---------------------------------------
+
+    def _snapshot_particles(self, t_step: float) -> None:
+        """最後の1周期中、各位相ビンに最初に該当したステップの粒子位置を保存する。
+
+        種ごとに最大 1000 点へ間引く (フレーム送出と同じストライド間引き)。
+        """
+        b = self._phase_bin(t_step)
+        for name in ("electron", "ion"):
+            if self._cycle_particles[name][b] is not None:
+                continue
+            sp = self.species[name]
+            n = len(sp.x)
+            if n > 1000:
+                stride = int(math.ceil(n / 1000))
+                pts = sp.x[::stride].copy()
+            else:
+                pts = sp.x.copy()
+            self._cycle_particles[name][b] = pts
+
+    def cycle_data(self) -> dict | None:
+        """RF 1周期の位相分解データを返す (WS done の cycle、prompts/28)。
+
+        RF 未設定・phase_bins=0・平均区間で未積算なら None。
+          bins:      位相ビン数
+          period_s:  RF 周期 [s]
+          phi:       (bins, N) 位相分解平均の電位 [V]
+          n_e / n_i: (bins, N) 同 密度 [m^-3]
+          particles: 種ごとの最後の1周期の生スナップショット (bins × ≤1000点)
+        ステップ数 0 の位相ビンはゼロのまま返す (平均区間が1周期以上あれば
+        通常発生しない。不足時は started に警告済み)。
+        """
+        if not self._cycle_enabled or self._cycle_phi is None:
+            return None
+        if int(self._cycle_count.sum()) == 0:
+            return None
+        # ステップ数 0 のビンはゼロ除算を避ける (積算値も 0 なので結果は 0)
+        cnt = np.maximum(self._cycle_count, 1)[:, None].astype(np.float64)
+        phi = self._cycle_phi / cnt
+        na = np.where(self._node_area > 0.0, self._node_area, 1.0)
+        n_e = self._cycle_ne / (cnt * na[None, :])
+        n_i = self._cycle_ni / (cnt * na[None, :])
+        # 追加フィールド (prompts/52)。規格化は averaged_fields と同じ規約:
+        # |E| は E ベクトルをビン平均してから絶対値 (要素値)、Te = (2/3)(KE和/重み和)/e、
+        # 電離レート = 積算重み / (ビン内時間 × 節点集中体積)
+        e_avg = self._cycle_e / cnt[:, :, None]  # cnt (bins,1) → (bins,1,1)
+        e_abs = np.sqrt(e_avg[:, :, 0] ** 2 + e_avg[:, :, 1] ** 2)  # (bins, M)
+        te = np.zeros_like(self._cycle_ne)
+        pos = self._cycle_ne > 0.0
+        te[pos] = (2.0 / 3.0) * (self._cycle_ke[pos] / self._cycle_ne[pos]) / QE
+        ion_rate = self._cycle_ion / (cnt * self.dt * na[None, :])
+        if self.canon is not None:
+            # 周期境界: スレーブ節点へマスター値をコピー (表示互換)
+            n_e = n_e[:, self.canon]
+            n_i = n_i[:, self.canon]
+            te = te[:, self.canon]
+            ion_rate = ion_rate[:, self.canon]
+
+        particles: dict[str, list] = {}
+        empty = np.zeros((0, 2))
+        for name in ("electron", "ion"):
+            snaps = (
+                self._cycle_particles[name]
+                if self._cycle_particles is not None
+                else [None] * self._cycle_bins
+            )
+            particles[name] = [s if s is not None else empty for s in snaps]
+
+        return {
+            "bins": self._cycle_bins,
+            "period_s": self._cycle_period,
+            "phi": phi,
+            "n_e": n_e,
+            "n_i": n_i,
+            "e_abs": e_abs,        # (bins, M) 要素値 (prompts/52)
+            "te_ev": te,           # (bins, N)
+            "ion_rate": ion_rate,  # (bins, N)
+            "particles": particles,
+        }
+
+    # ---- フレーム・実行 -------------------------------------------------------
+
+    def prepare_continue(
+        self,
+        n_steps: int,
+        frame_every: int | None = None,
+        avg_steps: int | None = None,
+        phase_bins: int | None = None,
+    ) -> None:
+        """完了/停止後の状態から追加実行の準備をする (prompts/32)。
+
+        維持するもの: 粒子状態 (x, v, w, elem)・表面電荷 q_surf・時刻 t・
+        step_count・乱数 Generator (SEE/注入/MCC)・注入状態・累計カウンタ。
+        乱数と粒子状態を保持するため「N+M ステップ連続実行」と
+        「N ステップ → continue で M ステップ」の粒子状態はビット単位で一致する
+        (平均系アキュムレータは読み取り専用で物理状態に影響しない)。
+
+        リセットするもの: 診断 history (追加区間分のみ返す。t は通算時刻のまま
+        単調増加)・平均/位相/コレクタのアキュムレータ (次の run_batch が追加区間の
+        設定で再有効化する)。avg_steps / phase_bins が None なら前回設定を踏襲する。
+        警告 (ωpe·dt 等) は再評価せず前回のものを流用する。
+        """
+        self.pic.n_steps = int(n_steps)
+        if frame_every is not None:
+            self.pic.frame_every = int(frame_every)
+        if avg_steps is not None:
+            self.pic.avg_steps = int(avg_steps)
+        if phase_bins is not None:
+            self.pic.phase_bins = int(phase_bins)
+            self._cycle_bins = int(phase_bins)
+            self._cycle_enabled = self._cycle_freq is not None and self._cycle_bins > 0
+            self._cycle_period = 1.0 / self._cycle_freq if self._cycle_enabled else 0.0
+
+        # 診断 history は追加区間分のみ (キー構成は不変)
+        self.history = {k: [] for k in self.history}
+        if self.circuit is not None:
+            self.circuit.reset_history()  # 回路の状態 (コンデンサの電荷) は引き継ぐ
+        # 位相別計測 (prompts/75) も追加区間分のみ返すようリセットする
+        self.timing = {k: 0.0 for k in self.timing}
+        # 平均・位相・コレクタ系のアキュムレータをリセット
+        self._accum_start = None
+        self._accum_count = 0
+        self._accum = {}
+        self._accum_phi = None
+        self._accum_e = None
+        self._accum_ke_e = None
+        self._accum_ion = None
+        self._cycle_phi = None
+        self._cycle_ne = None
+        self._cycle_ni = None
+        self._cycle_count = None
+        self._cycle_e = None
+        self._cycle_ke = None
+        self._cycle_ion = None
+        self._cycle_particles = None
+        self._snap_t_start = math.inf
+        self.fields = None
+        self.cycle = None
+        self.collector_results = None
+        self.collector_result = None
+        for st in self._collectors_st:
+            st["e"], st["a"], st["w"] = [], [], []
+            st["count"] = 0
+            st["weight"] = 0.0
+            st["samples"] = 0
+        # EEDF/EEPF 領域 (prompts/85) も同様にリセットする。e_max_ev 自動決定の
+        # 領域は次の平均区間で改めて確定し直す (前区間の電子分布から動いている可能性があるため)
+        self.eedf_results = None
+        for st in self._eedf_st:
+            st["sum_w"] = 0.0
+            st["sum_we"] = 0.0
+            st["overflow_w"] = 0.0
+            st["hist"] = None if st["auto"] else np.zeros(st["bins"])
+            if st["auto"]:
+                st["e_max"] = None
+        # 不動種の堆積キャッシュは維持して良い (粒子状態が変わらない限り有効)
+        # walk コスト診断 (prompts/88) も区間分の平均に切り替える
+        # (h_mean_m/h_min_m は run_batch 末尾で毎回再設定するので値が消えても問題ない)
+        self._walk_diag_sum = {"e": 0.0, "i": 0.0}
+        self._walk_diag_n = {"e": 0, "i": 0}
+
+    def _accum_walk_diag(self) -> None:
+        """診断 (prompts/88): 種ごとの平均横断セル数の推定を frame 間隔でサンプルする。
+
+        walk コスト ∝ 粒子が1ステップに横切るセル数 ≈ mean(|v|)·dt_species / h_mean。
+        イオンサブサイクル中はイオンの実効時間刻み (_sub·dt) を使う。O(N) の numpy
+        演算だが frame_every ステップに1回しか呼ばないためコストは無視できる
+        (呼び出し側で「frame」枠に計上される)。
+        """
+        if self._h_mean <= 0.0:
+            return
+        for name, key in (("electron", "e"), ("ion", "i")):
+            sp = self.species[name]
+            if len(sp.v) == 0:
+                continue
+            dt_sp = self.dt * self._sub if (name == "ion" and self._sub > 1) else self.dt
+            v_mean = float(np.mean(np.sqrt(np.sum(sp.v * sp.v, axis=1))))
+            self._walk_diag_sum[key] += v_mean * dt_sp / self._h_mean
+            self._walk_diag_n[key] += 1
+
+    def _make_frame(self, phi: np.ndarray) -> dict:
+        """WS 送出用フレーム (JSON 化可能な dict)。粒子は種ごと最大2000点に間引く。
+
+        n_e/n_i (種ごとの要素密度、prompts/81): ライブモニタで電位/密度を切り替え
+        表示できるよう、n[elem] = Σ_p w_p / V_elem を毎フレーム同梱する。
+        np.bincount は粒子数に対して軽量で、frame_every ステップごとの呼び出し
+        (通常は間引かれている) なのでコストは無視できる。
+        """
+        particles = {}
+        for name, sp in self.species.items():
+            n = len(sp.x)
+            if n > MAX_FRAME_PARTICLES:
+                stride = int(math.ceil(n / MAX_FRAME_PARTICLES))
+                pts = sp.x[::stride]
+            else:
+                pts = sp.x
+            particles[name] = pts.tolist()
+        diag = {k: v[-1] for k, v in self.history.items()}
+        m = len(self.tris)
+        el, ion = self.species["electron"], self.species["ion"]
+        n_e = np.bincount(el.elem, weights=el.w, minlength=m) / self.elem_vol
+        n_i = np.bincount(ion.elem, weights=ion.w, minlength=m) / self.elem_vol
+        return {
+            "type": "frame",
+            "step": self.step_count,
+            "t": self.t,
+            "phi": phi.tolist(),
+            "n_e": n_e.tolist(),
+            "n_i": n_i.tolist(),
+            "particles": particles,
+            "diag": diag,
+            # 阻止コンデンサの電極の今の電位・直近の周期の自己バイアス (prompts/134)。無ければ None
+            "circuit": None if self.circuit is None else self.circuit.frame(),
+            # 収束の判定の今の状態 (prompts/137)。判定しなければ None
+            "convergence": None if self.conv is None else self.conv.frame(),
+        }
+
+    def _conv_after_step(self, phi: np.ndarray) -> bool:
+        """収束の判定 (prompts/137): 周期平均の足し込み (stride ステップおき) と周期の境での判定。止めるなら True。
+
+        電子の密度は時間平均と同じく重心座標で重みを節点へ散布し、節点の体積 (_node_area) で割る。
+        """
+        c = self.conv
+        if c is None:
+            return False
+        if c.due(self.step_count):
+            el = self.species["electron"]
+            if len(el.x):
+                contrib = el.w[:, None] * self._bary_cached(el)
+                w_node = np.bincount(self._nidx_cached(el).ravel(), weights=contrib.ravel(), minlength=self.n_nodes)
+            else:
+                w_node = np.zeros(self.n_nodes)
+            c.sums.add("phi", phi)
+            c.sums.add("n_e", w_node * self._conv_inv_area)
+            c.sums.add("N_e", float(el.w.sum()))
+            c.sums.add("N_i", float(self.species["ion"].w.sum()))
+        if c.boundary_passed(self.t):
+            c.close_period(self.t, self.step_count, blocks=self._conv_blocks, circuit=self.circuit)
+        return c.stop_now
+
+    def run_batch(self, callback=None, should_stop=None, store_frames: bool = True):
+        """n_steps 回実行して (診断履歴, フレーム列) を返す (テスト用同期 API)。
+
+        callback(frame) は frame_every ステップごとに呼ばれる。
+        should_stop() が True を返したら中断する (WS の stop コマンド用)。
+        store_frames=False ならcallbackへは渡すが戻り値のフレーム列には保持しない。
+        WebSocket/バッチ実行は返却フレーム列を使わないため、大規模実行のメモリ増加を
+        避ける目的でFalseを指定する。既定Trueは既存テストAPIとの後方互換用。
+        完了時に時間平均フィールドを self.fields へ格納する (averaged_fields()
+        の結果。WS の done 送出と検証スクリプトが利用する)。
+        収束で止める設定 (convergence.stop、prompts/137) なら、収束したステップから平均区間を取って早めに終える
+        (時間平均・位相分解・コレクタ・EEDF の区間と、最後の 1 周期の粒子の写しはその平均区間に移す)。
+        """
+        # 時間平均区間を決めて積算を有効化する (avg_steps、None なら最後の 25%)。
+        # enable_density_accum が手動で呼ばれていればその設定を尊重する
+        if self._accum_start is None:
+            avg = (
+                self.pic.avg_steps
+                if self.pic.avg_steps is not None
+                else max(1, self.pic.n_steps // 4)
+            )
+            avg = min(avg, self.pic.n_steps)
+            self.enable_density_accum(self.step_count + self.pic.n_steps - avg + 1)
+
+        # 粒子スナップショット: 実行の最後の1周期を対象にする (prompts/28)
+        if self._cycle_enabled:
+            self._cycle_particles = {
+                "electron": [None] * self._cycle_bins,
+                "ion": [None] * self._cycle_bins,
+            }
+            self._snap_t_start = (
+                self.t + self.pic.n_steps * self.dt - self._cycle_period
+            )
+
+        frames: list[dict] = []
+        end = self.step_count + self.pic.n_steps
+        if self.conv is not None:
+            self.conv.begin_run()
+        while self.step_count < end:
+            if should_stop is not None and should_stop():
+                break
+            phi = self.step()
+            # 数値発散の検出 (prompts/57): NaN/Inf をフレームに載せると JSON として
+            # 不正になりフロントの解析が落ちるため、その前に明確なエラーで止める
+            if not (
+                math.isfinite(self.history["phi_min"][-1])
+                and math.isfinite(self.history["phi_max"][-1])
+                and math.isfinite(self.history["ke_e"][-1])
+            ):
+                raise ValueError(
+                    f"数値発散を検出しました (step {self.step_count}: 電位またはエネルギーが"
+                    "非有限値)。dt を小さくする、初期密度・注入量を下げる、"
+                    "メッシュを細かくする (デバイ長解像) 等を検討してください。"
+                    "警告一覧 (ωpe·dt、衝突確率など) も参照してください"
+                )
+            if self._conv_after_step(phi):
+                new_end = self.conv.stop_end(self.step_count, end, self.pic.avg_steps, self._accum_start)
+                if new_end is not None:
+                    end = new_end
+                    self.enable_density_accum(self.step_count + 1)
+                    if self._cycle_enabled:
+                        self._snap_t_start = self.t + (end - self.step_count) * self.dt - self._cycle_period
+            if self._cycle_enabled and self.t - self.dt >= self._snap_t_start - 1e-30:
+                # ステップ開始時刻の位相ビンで、粒子位置 (ステップ終端) を保存する
+                self._snapshot_particles(self.t - self.dt)
+            do_frame = self.step_count % self.pic.frame_every == 0
+            # walk コスト診断 (prompts/88): frame と同じ間隔でサンプルするが、
+            # n_steps < frame_every の短い実行でも必ず1回はサンプルされるよう
+            # ループの最終ステップでも強制的にサンプルする (フレーム自体の生成・
+            # 送出タイミングは do_frame のまま変更しない)
+            do_walk_diag = do_frame or self.step_count == end
+            if do_walk_diag:
+                t_frame0 = time.perf_counter()
+                if do_walk_diag:
+                    self._accum_walk_diag()
+                if do_frame:
+                    frame = self._make_frame(phi)
+                    if store_frames:
+                        frames.append(frame)
+                    if callback is not None:
+                        callback(frame)
+                self.timing["frame"] += time.perf_counter() - t_frame0
+        # walk コスト診断 (prompts/88) の確定。h_mean_m/h_min_m は prepare_continue の
+        # 一律リセットで 0 になっている可能性があるためここで必ず書き戻す
+        self.timing["h_mean_m"] = self._h_mean
+        self.timing["h_min_m"] = self._h_min
+        for key in ("e", "i"):
+            n = self._walk_diag_n[key]
+            self.timing[f"walk_cells_est_{key}"] = (
+                self._walk_diag_sum[key] / n if n else 0.0
+            )
+        self.fields = self.averaged_fields()
+        self.cycle = self.cycle_data()
+        self.collector_results = self._collector_data()
+        # 旧単数形の後方互換: 先頭コレクタの結果をエイリアスとして残す
+        self.collector_result = (
+            self.collector_results[0] if self.collector_results else None
+        )
+        self.eedf_results = self._eedf_data()
+        # continue可能な粒子状態は維持しつつ、実行中だけ必要なping-pong側を解放する。
+        self._release_push_walk_spares()
+        return self.history, frames

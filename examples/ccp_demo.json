@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "unit": "m",
+  "geometry": {
+    "domain": {
+      "polygon": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.02,
+          0.0
+        ],
+        [
+          0.02,
+          0.01
+        ],
+        [
+          0.0,
+          0.01
+        ]
+      ]
+    },
+    "boundaries": [
+      {
+        "edges": [
+          3
+        ],
+        "type": "dirichlet",
+        "voltage": 0.0,
+        "voltage_rf": {
+          "amplitude": 150.0,
+          "freq_hz": 13560000.0,
+          "phase_deg": 0.0
+        },
+        "see_gamma": 0.1
+      },
+      {
+        "edges": [
+          1
+        ],
+        "type": "dirichlet",
+        "voltage": 0.0,
+        "see_gamma": 0.1
+      },
+      {
+        "edges": [
+          0,
+          2
+        ],
+        "type": "symmetry"
+      }
+    ]
+  },
+  "mesh": {
+    "size": 0.001,
+    "mode": "cartesian"
+  },
+  "pic": {
+    "initial_plasma": {
+      "density": 100000000000000.0,
+      "te_ev": 2.0,
+      "ti_ev": 0.03,
+      "ion_mass_amu": 40.0,
+      "immobile_ions": false,
+      "seed": 2
+    },
+    "n_macro": 20000,
+    "dt": null,
+    "n_steps": 2000,
+    "frame_every": 20,
+    "mcc": {
+      "gas": {
+        "name": "Ar",
+        "pressure_pa": 10.0,
+        "temperature_k": 300.0
+      },
+      "electron_processes": [
+        {
+          "kind": "elastic",
+          "label": "[合成デモ] E + Ar -> E + Ar, Elastic",
+          "threshold_ev": 0.0,
+          "mass_ratio": 1.36E-05,
+          "energy_ev": [
+            0.0,
+            1.0,
+            10.0,
+            100.0
+          ],
+          "sigma_m2": [
+            1E-19,
+            1E-19,
+            1E-19,
+            1E-19
+          ]
+        },
+        {
+          "kind": "excitation",
+          "label": "[合成デモ] E + Ar -> E + Ar*(11.55eV), Excitation",
+          "threshold_ev": 11.55,
+          "mass_ratio": 0.0,
+          "energy_ev": [
+            11.55,
+            20.0,
+            100.0
+          ],
+          "sigma_m2": [
+            0.0,
+            3E-21,
+            1E-21
+          ]
+        },
+        {
+          "kind": "ionization",
+          "label": "[合成デモ] E + Ar -> E + E + Ar+, Ionization",
+          "threshold_ev": 15.759,
+          "mass_ratio": 0.0,
+          "energy_ev": [
+            15.759,
+            20.0,
+            100.0
+          ],
+          "sigma_m2": [
+            0.0,
+            1E-21,
+            2E-21
+          ]
+        }
+      ],
+      "ion_processes": [
+        {
+          "kind": "backscat",
+          "label": "[合成デモ] Ar+ + Ar -> , Backscat",
+          "threshold_ev": 0.0,
+          "mass_ratio": 0.0,
+          "energy_ev": [
+            0.0,
+            1.0,
+            100.0
+          ],
+          "sigma_m2": [
+            5E-19,
+            5E-19,
+            4E-19
+          ]
+        },
+        {
+          "kind": "isotropic",
+          "label": "[合成デモ] Ar+ + Ar -> , Isotropic",
+          "threshold_ev": 0.0,
+          "mass_ratio": 0.0,
+          "energy_ev": [
+            0.0,
+            1.0,
+            100.0
+          ],
+          "sigma_m2": [
+            3E-19,
+            3E-19,
+            2E-19
+          ]
+        }
+      ],
+      "seed": 4
+    },
+    "see_energy_ev": 2.0,
+    "phase_bins": 40,
+    "collectors": [
+      {
+        "p1": [
+          0.0,
+          0.0
+        ],
+        "p2": [
+          0.0,
+          0.01
+        ],
+        "label": "C1"
+      },
+      {
+        "p1": [
+          0.02,
+          0.0
+        ],
+        "p2": [
+          0.02,
+          0.01
+        ],
+        "label": "C2"
+      }
+    ]
+  },
+  "fluid2d": {
+    "init_density_m3": 100000000000000.0,
+    "init_te_ev": 2.0,
+    "gas_pressure_pa": 10.0,
+    "gas_temperature_k": 300.0,
+    "ion_mass_amu": 40.0,
+    "n_steps": 2000,
+    "frame_every": 20,
+    "avg_steps": 200,
+    "phase_bins": 16
+  }
+}

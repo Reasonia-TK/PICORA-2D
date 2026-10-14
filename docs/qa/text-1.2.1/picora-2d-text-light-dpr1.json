@@ -1,0 +1,241 @@
+{
+  "dpr": 1,
+  "theme": "light",
+  "geometry": [
+    {
+      "text": "rf_electrode",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "lower_insulator",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "upper_insulator",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "rf_electrode",
+      "fill": "#c96442",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#3b6ea8",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "center",
+      "fill": "#7b5ea7",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    }
+  ],
+  "field": [
+    {
+      "text": "rf_electrode",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "lower_insulator",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "upper_insulator",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "rf_electrode",
+      "fill": "#c96442",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#3b6ea8",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "center",
+      "fill": "#7b5ea7",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-80.85",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-56.29",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-31.74",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-7.185",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "17.37",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "電位 φ [V]",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    }
+  ],
+  "density": [
+    {
+      "text": "rf_electrode",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "lower_insulator",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "upper_insulator",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "rf_electrode",
+      "fill": "#c96442",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#3b6ea8",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "center",
+      "fill": "#7b5ea7",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "0",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "4.4e+14",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "8.7e+14",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "1.3e+15",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "1.7e+15",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "電子密度 n_e [m^-3]",
+      "fill": "#141413",
+      "stroke": "#faf9f5",
+      "width": 2,
+      "font": "12px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    }
+  ]
+}

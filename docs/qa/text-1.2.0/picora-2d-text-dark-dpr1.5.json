@@ -1,0 +1,148 @@
+{
+  "dpr": 1.5,
+  "theme": "dark",
+  "geometry": [
+    {
+      "text": "rf_electrode",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "lower_insulator",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "upper_insulator",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "rf_electrode",
+      "fill": "#d97757",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#7aa7d9",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "center",
+      "fill": "#b39ddb",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    }
+  ],
+  "field": [
+    {
+      "text": "rf_electrode",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "lower_insulator",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "upper_insulator",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "rf_electrode",
+      "fill": "#d97757",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "ground_electrode",
+      "fill": "#7aa7d9",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "center",
+      "fill": "#b39ddb",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-80.85",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-56.29",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-31.74",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "-7.185",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "17.37",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    },
+    {
+      "text": "電位 φ [V]",
+      "fill": "#f5f4ee",
+      "stroke": "#f5f4ee",
+      "width": 3,
+      "font": "11px system-ui, -apple-system, \"Segoe UI\", sans-serif"
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+/* PICORA-2D: warm clay tokens。色の定義はこのファイルへ集約。 */
+:root {
+  color-scheme: light;
+  --bg:#FAF9F5; --surface:#F0EEE6; --surface-2:#E8E6DC; --border:#E0DDD4;
+  --text:#141413; --text-muted:#6B6A65; --text-disabled:#A8A69E;
+  --accent:#C96442; --accent-strong:#B4532F; --accent-hover:#A84F31;
+  --accent-fg:#FFFFFF; --accent-text:#A84F31; --selection:#C9644226; --focus:#C96442;
+  --success:#2F7D4F; --warning:#9A6700; --error:#B42318; --info:#3B6EA8;
+  --series-1:#C96442; --series-2:#3B6EA8; --series-3:#2F7D4F;
+  --series-4:#9A6700; --series-5:#7B5EA7; --series-6:#5F7A7A;
+  --shadow-color:#14141320; --backdrop:#14141373;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#262624; --surface:#30302E; --surface-2:#3A3A37; --border:#45453F;
+  --text:#F5F4EE; --text-muted:#A6A39A; --text-disabled:#6B6A65;
+  --accent:#D97757; --accent-strong:#D97757; --accent-hover:#E08A6A;
+  --accent-fg:#1F1E1D; --accent-text:#E08A6A; --selection:#D9775733; --focus:#D97757;
+  --success:#6FBF8B; --warning:#E3B341; --error:#F07167; --info:#7AA7D9;
+  --series-1:#D97757; --series-2:#7AA7D9; --series-3:#6FBF8B;
+  --series-4:#E3B341; --series-5:#B39DDB; --series-6:#9DB8B8;
+  --shadow-color:#00000040; --backdrop:#00000073;
+}
+:root {
+  --bg-panel:var(--surface); --bg-elev:var(--surface-2); --bg-hover:var(--surface-2); --bg-active:var(--selection);
+  --ok:var(--success); --warn:var(--warning); --shadow:0 6px 24px var(--shadow-color);
+  --canvas-bg:var(--bg); --canvas-domain:var(--surface); --canvas-edge:var(--text-muted);
+  --canvas-grid:var(--border); --canvas-wire:var(--text-muted); --canvas-wire-field:var(--border);
+  --canvas-isoline:var(--text); --canvas-ruler-bg:var(--surface); --canvas-ruler-border:var(--border);
+  --canvas-ruler-tick:var(--text-muted); --canvas-ruler-text:var(--text);
+  --canvas-panel:var(--surface); --canvas-panel-border:var(--border);
+  --canvas-label-halo:var(--canvas-bg);
+  --color-conductor:var(--series-4); --color-dielectric:var(--series-2); --color-charge:var(--series-5);
+  --color-dirichlet:var(--series-1); --color-symmetry:var(--series-3); --color-periodic:var(--series-5);
+  --color-axis:var(--series-6); --color-selection:var(--accent); --color-handle:var(--accent);
+  --color-handle-mid:var(--series-2); --color-draw:var(--accent); --color-sketch:var(--text-muted);
+  --color-snap:var(--success); --color-fill-preview:var(--accent); --color-emitter:var(--series-3);
+  --color-injector:var(--series-5); --color-gasbc:var(--series-4); --color-eedf:var(--series-5);
+  --color-edgesize:var(--series-2); --color-sheath:var(--series-4); --color-amr:var(--series-3);
+  --color-profile:var(--text); --color-measure:var(--series-5); --color-probe:var(--text);
+  --collector-1:var(--series-1); --collector-2:var(--series-2); --collector-3:var(--series-3);
+  --collector-4:var(--series-4); --collector-5:var(--series-5); --collector-6:var(--series-6);
+  --collector-7:var(--series-2); --collector-8:var(--series-5);
+  --series-2-alpha-35:color-mix(in srgb, var(--series-2) 35%, transparent);
+  --series-2-alpha-55:color-mix(in srgb, var(--series-2) 55%, transparent);
+  --series-4-alpha-55:color-mix(in srgb, var(--series-4) 55%, transparent);
+  --text-muted-alpha-35:color-mix(in srgb, var(--text-muted) 35%, transparent);
+}

@@ -1,0 +1,17 @@
+backend/.venv/
+backend/build/
+backend/dist/
+backend/*.egg-info/
+ui/node_modules/
+ui/dist/
+ui/src-tauri/target/
+.cache/
+.uv-cache/
+.test-*/
+.runtime/
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+ui/test-results/
+ui/playwright-report/

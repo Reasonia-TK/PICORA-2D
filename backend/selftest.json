@@ -1,0 +1,35 @@
+{
+  "name": "PICORA-2D",
+  "version": "0.1.0",
+  "checks": [
+    {
+      "name": "poisson_cpu",
+      "status": "ok",
+      "detail": "CPU Cartesian + embedded boundary Poisson",
+      "elapsed_s": 1.1742298000026494
+    },
+    {
+      "name": "fluid2d_cpu",
+      "status": "ok",
+      "detail": "CartesianFluid2dSimulation: 4 steps",
+      "elapsed_s": 0.4099041000008583
+    },
+    {
+      "name": "pic_cuda",
+      "status": "ok",
+      "detail": "GpuPicSimulation: 4 steps",
+      "elapsed_s": 5.465871699852869
+    },
+    {
+      "name": "fluid2d_cuda",
+      "status": "ok",
+      "detail": "GpuCartesianFluid2dSimulation: 4 steps",
+      "elapsed_s": 0.9161898999009281
+    }
+  ],
+  "gpu": {
+    "available": true,
+    "detail": "NVIDIA GeForce RTX 5070 Ti"
+  },
+  "ok": true
+}

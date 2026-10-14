@@ -1,0 +1,101 @@
+{
+  "source_icon": "C:\\Works\\20261009_PICORA-2D\\ui\\src-tauri\\icons\\icon.ico",
+  "tolerance": 0,
+  "mode": "launch",
+  "windows": [
+    {
+      "hwnd": 4788440,
+      "pid": 26704,
+      "title": "PICORA-2D",
+      "class": "Tauri Window",
+      "raw_icon_handles": {
+        "WM_GETICON_BIG": 178393053,
+        "WM_GETICON_SMALL": 178393053,
+        "WM_GETICON_SMALL2": 178393053,
+        "GCLP_HICON": 0,
+        "GCLP_HICONSM": 0
+      },
+      "icon_query_errors": [],
+      "large_icon_missing": false,
+      "icons": [
+        {
+          "kind": "large",
+          "handle_source": "WM_GETICON/large",
+          "handle": 178393053,
+          "width": 256,
+          "height": 256,
+          "matching": true,
+          "comparisons": [
+            {
+              "background": "black",
+              "matching": true,
+              "different_pixels": 0,
+              "max_channel_difference": 0,
+              "runtime_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "source_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-large-256x256-black-runtime.png",
+              "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-large-256x256-black-source.png"
+            },
+            {
+              "background": "white",
+              "matching": true,
+              "different_pixels": 0,
+              "max_channel_difference": 0,
+              "runtime_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "source_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-large-256x256-white-runtime.png",
+              "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-large-256x256-white-source.png"
+            }
+          ]
+        },
+        {
+          "kind": "small",
+          "handle_source": "WM_GETICON/small",
+          "handle": 178393053,
+          "width": 256,
+          "height": 256,
+          "matching": true,
+          "comparisons": [
+            {
+              "background": "black",
+              "matching": true,
+              "different_pixels": 0,
+              "max_channel_difference": 0,
+              "runtime_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "source_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-small-256x256-black-runtime.png",
+              "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-small-256x256-black-source.png"
+            },
+            {
+              "background": "white",
+              "matching": true,
+              "different_pixels": 0,
+              "max_channel_difference": 0,
+              "runtime_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "source_sha256": "2ed3526997f36bde5096b9b9db87c01f47c78abd470e0199168e8043add77f1e",
+              "runtime_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-small-256x256-white-runtime.png",
+              "source_png": "C:\\Works\\20261009_PICORA-2D\\docs\\qa\\icons-1.1.1\\4788440-small-256x256-white-source.png"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "pid": 26704,
+  "process_image": "C:\\Works\\20261009_PICORA-2D\\ui\\src-tauri\\target\\release\\picora-2d.exe",
+  "matching": true,
+  "cleanup": {
+    "pid": 26704,
+    "action": "WM_CLOSE then taskkill /PID /T /F (explicit --force-close)",
+    "hwnds": [
+      4788440,
+      29886682
+    ],
+    "exited": true,
+    "forced": true,
+    "taskkill_returncode": 0,
+    "taskkill_stdout": "成功: PID 34812 のプロセス (PID 29880 の子プロセス) を終了しました。\n成功: PID 28016 のプロセス (PID 29880 の子プロセス) を終了しました。\n成功: PID 39172 のプロセス (PID 29880 の子プロセス) を終了しました。\n成功: PID 24228 のプロセス (PID 29880 の子プロセス) を終了しました。\n成功: PID 25060 のプロセス (PID 29880 の子プロセス) を終了しました。\n成功: PID 30512 のプロセス (PID 4812 の子プロセス) を終了しました。\n成功: PID 29880 のプロセス (PID 26704 の子プロセス) を終了しました。\n成功: PID 4812 のプロセス (PID 26704 の子プロセス) を終了しました。\n成功: PID 26704 のプロセス (PID 5220 の子プロセス) を終了しました。",
+    "taskkill_stderr": "",
+    "exit_code": 1
+  }
+}

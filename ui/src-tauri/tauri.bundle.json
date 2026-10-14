@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "../../backend/dist/picora-2d-backend/": "backend/",
+      "target/licenses/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
+      "../../LICENSE": "LICENSE.txt",
+      "icons/icon.ico": "icons/picora-shared-ad39f965.ico"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "nsis/hooks.nsh"
+      }
+    }
+  }
+}
